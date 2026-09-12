@@ -87,20 +87,39 @@ static DWORD                      g_statusFromCache = 0;
 //  任务栏剩下的空间，系统会把它按可用宽度压回去 —— 结果按钮正好铺满整条任务栏，
 //  右侧一点空白都不剩，鼠标没有地方可以右键，也就点不出「任务栏设置」。
 //
-//  解决思路：先标定出"按钮区总可用宽度"，再让 每个按钮 = 可用宽度/按钮数 - 预留/按钮数，
+//  解决思路：先测出"按钮区总可用宽度"，再让
+//      每个按钮 = min(可用宽度/按钮数, 上限) - 预留/按钮数
 //  这样无论开多少个窗口，末尾始终空出约 `预留` 这么多 DIP。
 //
-//  标定只认一个证据：任务栏自己刚刚写进按钮的宽度。它要么等于我们刚写进去的值
-//  （说明系统没在压缩我们，读数无效），要么小于我们设的上限（说明系统在按可用空间
-//  压缩，这个值就是"可用宽度 / 按钮数"）。用这条规则就自然避开了自我反馈的死循环。
+//  可用宽度怎么测，v0.2.1 换过一次做法：
+//    v0.2 拿"按钮自己被压成了多宽"去反推，属于自我反馈——我们写宽度会触发 XAML
+//    动画，动画中间帧又被当成系统的值，于是目标反复变、永不收敛（实测每秒几十轮）。
+//    现在改成读**按钮容器**的 ActualWidth：容器由系统排布、我们从不写它，
+//    是一个干净的观测点（见 MeasureAvailable）。
 // ---------------------------------------------------------------------------
 static double                     g_available      = 0.0;  // 按钮区可用总宽（DIP），0 = 未标定
 static double                     g_lastApplied    = -1.0; // 上一次写入的宽度
-static bool                       g_appliedOnce    = false;// 是否已经应用过一轮（之后读数才可信）
-static bool                       g_outerWritable  = true; // 是否还能由我们决定按钮外层宽度
+static bool                       g_appliedOnce    = false;// 是否已经应用过一轮
 static std::atomic<unsigned>      g_pubWidth{0u};          // 供共享内存展示
 static std::atomic<unsigned>      g_pubAvail{0u};
 static std::atomic<unsigned>      g_pubCount{0u};
+
+// ---- "每个按钮只写一次" 闩锁（v0.2.1 新增，修的是最要命的一个 bug）--------
+//  XAML 会**动画**过渡到我们写进去的宽度，动画期间 btn.Width() 返回的是中间值。
+//  如果每帧都拿这个中间值和我们自己的目标比，就会一直判定"还没设上"而反复写入；
+//  每次写入都会取消动画并重新布局 —— 于是形成永不收敛的重排循环。实测日志里
+//  每秒几十条，按钮一直在抖，explorer 白烧 CPU。这里的做法是：按按钮对象记住
+//  "我已经把它设成多少了"，目标没变就不再写。
+struct TeqwApplied { void* pThis; double want; DWORD tick; };
+static TeqwApplied                g_appliedList[96];
+static int                        g_appliedN       = 0;
+
+// 可用宽度只用"按钮容器"测量，不再拿按钮自己的宽度去反推（自我反馈的根源）
+static DWORD                      g_availWinStart  = 0;
+static double                     g_availWinMax    = 0.0;
+static int                        g_availWinCount  = 0;
+static DWORD                      g_availLoggedAt  = 0;
+static double                     g_availSeenMax   = 0.0;  // 历史最大值，用于螺旋保险丝
 
 static HANDLE                     g_evUnload       = nullptr;
 static HANDLE                     g_evUnloaded     = nullptr;
@@ -180,6 +199,8 @@ static FrameworkElement FindChildByName(DependencyObject const& root,
 static std::atomic<int> g_logMissingPanel{0};
 static std::atomic<int> g_logApplied{0};
 static std::atomic<int> g_logPath{0};
+static std::atomic<int> g_logNoContainer{0};
+static std::atomic<int> g_logChain{0};
 
 // ---------------------------------------------------------------------------
 //  两条路径：Windows 有两套任务栏标签实现，按钮内部结构完全不同，必须分别处理。
@@ -293,35 +314,97 @@ static int NoteButton(void* pThis) {
 }
 
 // ---------------------------------------------------------------------------
-//  标定"按钮区可用总宽"
+//  测量"按钮区可用总宽"（v0.2.1 的改法）
 //
-//  规则见文件顶部注释：只接受"系统自己刚写进去、且与我们写入的值不同"的宽度。
-//  另外要求它明显小于我们设的上限（否则我们分辨不出这是系统的自适应结果，
-//  还是我们设的内容宽度被原样采纳了）。
-//  变化小于 8 DIP 时不重新标定，避免来回抖动导致按钮宽度不稳。
+//  v0.2 是拿"按钮自己被系统写成多宽"去反推总宽，这有个致命的自我反馈：
+//  我们写宽度 -> XAML 动画过渡 -> 动画中间帧被当成"系统的值" -> 目标又变 ->
+//  再写一次……实测每秒几十轮，永远收敛不了。
+//
+//  现在改成从按钮往上找**装按钮的那个容器**，读它的 ActualWidth。
+//  容器宽度完全由系统决定、我们从不写它，所以这是干净、稳定的测量。
+//  判据：单个任务栏按钮不可能有几百 DIP 宽，向上遇到的第一个
+//  ActualWidth >= 400 的元素即按钮容器。
 // ---------------------------------------------------------------------------
-static void CalibrateAvailable(FrameworkElement const& btn, int count) {
-    if (!g_appliedOnce || count < 1) return;
+static FrameworkElement FindButtonContainer(DependencyObject start) {
+    DependencyObject cur = start;
+    for (int i = 0; i < 8; ++i) {
+        cur = VisualTreeHelper::GetParent(cur);
+        if (!cur) break;
+        auto fe = cur.try_as<FrameworkElement>();
+        if (!fe) continue;
+        double w = fe.ActualWidth();
+        if (std::isfinite(w) && w >= 400.0) return fe;
+    }
+    return nullptr;
+}
 
-    double sysW = btn.Width();
-    if (!std::isfinite(sysW) || sysW < static_cast<double>(TEQW_MIN_WIDTH)) return;
-    if (std::fabs(sysW - g_lastApplied) < 0.5) return;          // 是我们自己写的
-    if (sysW >= static_cast<double>(g_itemWidth.load()) - 0.5) return;  // 没有压缩迹象
+// 找一个按钮上次被我们写成了多少；没有就新建一格
+static TeqwApplied* FindAppliedSlot(void* pThis) {
+    for (int i = 0; i < g_appliedN; ++i) {
+        if (g_appliedList[i].pThis == pThis) return &g_appliedList[i];
+    }
+    if (g_appliedN >= 96) g_appliedN = 0;   // 表满（explorer 反复重建按钮）就从头来
+    g_appliedList[g_appliedN] = TeqwApplied{ pThis, -1.0, 0 };
+    return &g_appliedList[g_appliedN++];
+}
 
-    // 走到这里说明：外层宽度是系统自己写进去的，我们写不过它。
-    // 立刻放弃写外层——继续硬写会变成"每帧都在改"的无限重排。
-    // 好消息是不需要它：把内容宽度压到可用宽度以下，系统自然会留出空白。
-    if (g_outerWritable) {
-        g_outerWritable = false;
-        LogLine(L"[i] 外层宽度由系统掌控，改用只约束内容的方式（留白同样生效）");
+// 先观察 1.5 秒再采纳，避免把关闭窗口之类的过渡态当成稳态；
+// 变化不足 12 DIP 不动，日志 3 秒最多一条——都是为了不产生抖动和日志刷屏。
+static void MeasureAvailable(FrameworkElement const& btn, int count) {
+    DWORD now = GetTickCount();
+
+    auto container = FindButtonContainer(btn);
+    if (!container) {
+        if (g_logNoContainer.fetch_add(1) < 1) {
+            LogLine(L"[!] 没能从按钮往上找到按钮容器，本次按上限宽度算（右侧可能不留白）");
+        }
+        return;
+    }
+    double w = container.ActualWidth();
+    if (!std::isfinite(w) || w < 400.0) return;
+
+    // 把祖先链打一次：万一挑中的"容器"不是装按钮的那个，从这几行就能看出来
+    if (g_logChain.fetch_add(1) < 1) {
+        DependencyObject cur = btn;
+        for (int i = 0; i < 8; ++i) {
+            cur = VisualTreeHelper::GetParent(cur);
+            if (!cur) break;
+            auto fe = cur.try_as<FrameworkElement>();
+            if (!fe) continue;
+            // 注意：必须先把 Name() 存成具名变量再取 c_str()。
+            // 写成 fe.Name().c_str() 拿到的是临时 hstring 的内部指针，
+            // 那条语句一结束就悬空了（UB，会直接把 explorer 搞崩）。
+            winrt::hstring nm = fe.Name();
+            LogLine(L"[i] 祖先[%d] %s  width=%.1f", i,
+                    nm.empty() ? L"(无名)" : nm.c_str(), fe.ActualWidth());
+        }
     }
 
-    double avail = sysW * count;
-    if (g_available <= 0.0 || std::fabs(avail - g_available) > 8.0) {
+    if (g_availWinStart == 0 || count != g_availWinCount) {
+        g_availWinStart = now;
+        g_availWinMax   = 0.0;
+        g_availWinCount = count;
+    }
+    if (w > g_availWinMax) g_availWinMax = w;
+    if (now - g_availWinStart < 1500) return;   // 窗口没满，先只观察
+
+    double avail = g_availWinMax;
+    g_availWinStart = now;                      // 开下一个窗口，托盘宽度变了能跟上
+    g_availWinMax   = 0.0;
+
+    // 保险丝：万一"容器"其实是按内容撑开的（而不是被系统拉伸），我们把按钮改窄
+    // 就会连带把容器也改窄，于是形成缓慢缩小的死亡螺旋。低于历史最大值 60% 就不认。
+    if (avail > g_availSeenMax) g_availSeenMax = avail;
+    if (g_availSeenMax > 0.0 && avail < g_availSeenMax * 0.6) return;
+
+    if (g_available <= 0.0 || std::fabs(avail - g_available) > 12.0) {
         g_available = avail;
-        LogLine(L"[i] 标定：系统给每个按钮 %.1f DIP × %d 个 = 可用宽度 %.1f DIP",
-                sysW, count, avail);
         g_pubAvail.store(static_cast<unsigned>(avail + 0.5));
+        if (now - g_availLoggedAt > 3000) {
+            g_availLoggedAt = now;
+            LogLine(L"[i] 标定: 按钮容器 %.1f DIP / %d 个按钮 = 每个 %.1f DIP，预留 %d DIP",
+                    avail, count, avail / count, g_reserved.load());
+        }
     }
 }
 
@@ -358,7 +441,7 @@ static void ApplyFixedWidthToButton(void* pThis) {
         want = std::numeric_limits<double>::quiet_NaN();
     } else {
         const double maxW = static_cast<double>(g_itemWidth.load());
-        CalibrateAvailable(buttonElement, count);
+        MeasureAvailable(buttonElement, count);
 
         double perButton = (g_available > 0.0) ? (g_available / count) : maxW;
         if (perButton > maxW) perButton = maxW;   // 按钮很少时不要超出上限
@@ -395,19 +478,32 @@ static void ApplyFixedWidthToButton(void* pThis) {
                             : L"普通面板（旧式实现），直接设置 IconPanel.Width");
     }
 
-    // 两层一起改才稳：
-    //   外层（按钮本体）—— 决定这个按钮最终占多宽，是"能不能留出空白"的关键。
-    //                      系统的自适应布局会往这里写值，我们钩子跑在它之后，所以写得住。
-    //   内层（IconPanel）—— 决定内容怎么排，避免标签把按钮撑开。
-    // 若发现外层其实是系统在写（见 CalibrateAvailable），就只做内层。
+    //  外层（按钮本体）—— 决定这个按钮最终占多宽，是"能不能留出空白"的关键。
+    //  内层（IconPanel）—— 决定内容怎么排，避免标签把按钮撑开。
+    //
+    //  v0.2.1 关键改动：外层宽度加了"每个按钮只写一次"的闩锁。
+    //  以前是拿 btn.Width() 和 want 比来判断"要不要写"，但 XAML 会动画过渡到目标值，
+    //  动画期间读到的是中间帧，于是永远判定"还没写上"——而每次写入都会取消动画并
+    //  重新布局，形成永不停止的重排（按钮一直在抖，日志每秒几十条）。
     bool changed = false;
     if (unloading) {
         buttonElement.Width(std::numeric_limits<double>::quiet_NaN());
-    } else if (g_outerWritable) {
-        double curOuter = buttonElement.Width();
-        bool sameOuter = (curOuter == want) || (std::isnan(curOuter) && std::isnan(want));
-        if (!sameOuter) {
+        FindAppliedSlot(pThis)->want = std::numeric_limits<double>::quiet_NaN();
+    } else {
+        DWORD now = GetTickCount();
+        TeqwApplied* slot = FindAppliedSlot(pThis);
+        bool needWrite = true;
+        if (std::isfinite(slot->want) && std::fabs(slot->want - want) < 0.5) {
+            // 目标没变。只有"确实被系统改回去了"才补写一次，且 1 秒最多补一次，
+            // 避免在动画期间反复打断动画。
+            double cur = buttonElement.Width();
+            bool drifted = std::isfinite(cur) && std::fabs(cur - want) > 3.0;
+            if (!drifted || now - slot->tick < 1000) needWrite = false;
+        }
+        if (needWrite) {
             buttonElement.Width(want);
+            slot->want = want;
+            slot->tick = now;
             changed = true;
         }
     }
@@ -418,7 +514,7 @@ static void ApplyFixedWidthToButton(void* pThis) {
     }
 
     if (!unloading) {
-        g_lastApplied = want;   // 记住我们写的值，标定时用来区分"谁写的"
+        g_lastApplied = want;   // 最近一次的目标值（仅用于共享内存/诊断）
         g_appliedOnce = true;
     }
 

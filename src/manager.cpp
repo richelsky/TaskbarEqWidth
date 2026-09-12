@@ -260,6 +260,37 @@ static bool TryReadStatus(TeqwStatus& out) {
     return ok;
 }
 
+// 日志兜底：hook.log 由 DLL 用 UTF-16LE 写出，直接按宽字符找标志串。
+// 只用于"状态通道没读到"时的确认，不替代状态通道。
+static bool HookLogHasSuccess() {
+    std::wstring p = GetInstallDir() + L"\\hook.log";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+
+    LARGE_INTEGER sz{};
+    if (!GetFileSizeEx(h, &sz) || sz.QuadPart <= 0 || sz.QuadPart > 4 * 1024 * 1024) {
+        CloseHandle(h);
+        return false;
+    }
+    std::string buf(static_cast<size_t>(sz.QuadPart), '\0');
+    DWORD rd = 0;
+    BOOL r = ReadFile(h, &buf[0], static_cast<DWORD>(buf.size()), &rd, nullptr);
+    CloseHandle(h);
+    if (!r) return false;
+    buf.resize(rd);
+
+    const wchar_t* pat = L"[OK] 钩子已生效";
+    size_t plen = wcslen(pat);
+    size_t n = buf.size() / sizeof(wchar_t);
+    if (n < plen) return false;
+    const wchar_t* w = reinterpret_cast<const wchar_t*>(buf.data());
+    for (size_t i = 0; i + plen <= n; ++i) {
+        if (wmemcmp(w + i, pat, plen) == 0) return true;
+    }
+    return false;
+}
+
 // 请求 DLL 卸载，返回是否确认卸载完成
 static bool RequestUnload(int timeoutMs) {
     if (!IsDllResident()) return true;
@@ -395,59 +426,86 @@ static int DoInstall(DWORD width, DWORD reserved, bool autostart, bool quiet) {
     //    这里刻意不用一个短超时：首次运行要从微软符号服务器下载 PDB，实测这个文件
     //    有 47.6 MB，慢的时候要十几分钟。如果只等 35 秒就报"失败"，其实几分钟后它
     //    就成功了——那是最容易误导人的一种结果。所以改成轮询 + 实时进度。
-    HANDLE hInit = OpenEventW(SYNCHRONIZE, FALSE, TEQW_EV_INITDONE);
     if (!quiet) wprintf(L"[*] 等待钩子就绪...\n");
 
-    bool initDone = false;
-    int lastPct = -1;
-    int lastShownSec = -1;
-    for (int sec = 0; sec < 1800; ++sec) {   // 上限 30 分钟
-        if (hInit && WaitForSingleObject(hInit, 1000) == WAIT_OBJECT_0) {
-            initDone = true;
-            break;
+    // 先等上一份实例留下的共享内存彻底消失。
+    // 否则我们会立刻读到那个旧映射里的空壳状态，把一次成功的安装误报成
+    // "未能挂上钩子"——v0.2 就是这么冤枉了自己的。
+    for (int i = 0; i < 30; ++i) {
+        HANDLE hOld = OpenFileMappingW(FILE_MAP_READ, FALSE, TEQW_SHM_STATUS);
+        if (!hOld) break;
+        CloseHandle(hOld);
+        Sleep(100);
+    }
+
+    bool       initDone = false;
+    bool       sawStatus = false;
+    TeqwStatus snap{};
+    int        lastPct = -1;
+    DWORD      t0 = GetTickCount();
+    for (;;) {
+        // 每轮都重新打开事件和映射：DLL 是注入之后才创建它们的，
+        // 注入刚返回时打开大概率拿到 NULL。原来的代码只打开一次，拿到 NULL 后
+        // 那个 1 秒等待被 if 短路掉，1800 次循环在毫秒内跑完，直接打印"等待超时"
+        // ——假失败。这里改成"每轮重开 + 无论如何都睡 250ms"。
+        HANDLE hInit = OpenEventW(SYNCHRONIZE, FALSE, TEQW_EV_INITDONE);
+        if (hInit) {
+            DWORD w = WaitForSingleObject(hInit, 250);
+            CloseHandle(hInit);
+            if (w == WAIT_OBJECT_0) { initDone = true; break; }
+        } else {
+            Sleep(250);
         }
-        // 事件没等到也不要紧：DLL 会把进度写进共享内存，initDone 置 1 即表示跑完了
-        TeqwStatus snap{};
-        if (TryReadStatus(snap) && snap.magic == TEQW_STATUS_MAGIC) {
-            if (snap.initDone) {
-                initDone = true;
-                break;
-            }
-            if (!quiet && snap.downloadPct <= 100) {
-                int pct = static_cast<int>(snap.downloadPct);
+
+        TeqwStatus tmp{};
+        if (TryReadStatus(tmp) && tmp.magic == TEQW_STATUS_MAGIC) {
+            snap = tmp;
+            sawStatus = true;
+            if (tmp.initDone) { initDone = true; break; }
+            if (!quiet && tmp.downloadPct <= 100) {
+                int pct = static_cast<int>(tmp.downloadPct);
                 if (pct != lastPct) {
                     wprintf(L"\r[*] 正在下载符号文件 PDB: %3d%%    ", pct);
                     lastPct = pct;
                 }
-            } else if (!quiet && sec >= 5 && sec - lastShownSec >= 10) {
-                wprintf(L"\r[*] 已等待 %d 秒（正在定位符号）...    ", sec);
-                lastShownSec = sec;
+            } else if (!quiet && GetTickCount() - t0 > 5000) {
+                wprintf(L"\r[*] 已等待 %lu 秒（正在定位符号）...    ",
+                        (GetTickCount() - t0) / 1000);
             }
         }
+        if (GetTickCount() - t0 > 1800000) break;   // 上限 30 分钟
     }
-    if (hInit) CloseHandle(hInit);
-    if (!quiet && (lastPct >= 0 || lastShownSec >= 0)) wprintf(L"\n");
-    if (!initDone && !quiet) {
-        wprintf(L"[!] 等待超时，DLL 仍未报告初始化完成。下面照常读取它留下的状态。\n");
-    }
-    Sleep(200);
+    if (!quiet && lastPct >= 0) wprintf(L"\n");
 
     // 6) 读取 DLL 回报的状态
+    TeqwStatus finalSnap{};
+    bool haveSnap = false;
+    if (sawStatus && snap.magic == TEQW_STATUS_MAGIC) {
+        finalSnap = snap;
+        haveSnap = true;
+    } else if (TryReadStatus(finalSnap) && finalSnap.magic == TEQW_STATUS_MAGIC) {
+        haveSnap = true;
+    }
+
     bool ok = false;
     int shownWidth = static_cast<int>(width);
-    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, TEQW_SHM_STATUS);
-    if (hMap) {
-        auto* st = static_cast<TeqwStatus*>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0,
-                                                          sizeof(TeqwStatus)));
-        if (st && st->magic == TEQW_STATUS_MAGIC) {
-            ok = st->hookOk != 0;
-            if (st->itemWidth > 0) shownWidth = static_cast<int>(st->itemWidth);
-            if (!quiet) {
-                wprintf(L"[*] 符号来源: %s\n", st->fromCache ? L"本地缓存" : L"在线下载");
-            }
+    if (haveSnap) {
+        ok = finalSnap.hookOk != 0;
+        if (finalSnap.itemWidth > 0) shownWidth = static_cast<int>(finalSnap.itemWidth);
+        if (!quiet) {
+            wprintf(L"[*] 符号来源: %s\n",
+                    finalSnap.fromCache ? L"本地缓存" : L"在线下载");
         }
-        if (st) UnmapViewOfFile(st);
-        CloseHandle(hMap);
+    } else if (!quiet) {
+        wprintf(L"[!] 等待超时，DLL 仍未报告初始化完成。正在核对日志...\n");
+    }
+
+    // 日志兜底：日志里写了"[OK] 钩子已生效"就是成功。
+    // 状态通道（事件/共享内存）可能因为时序原因没读到，但日志是 DLL 自己写的，
+    // 不该因为"没等到事件"就把一次成功的安装报成失败。
+    if (!ok && HookLogHasSuccess()) {
+        ok = true;
+        if (!quiet) wprintf(L"[*] 已从 hook.log 确认钩子生效（状态通道未收到回报）\n");
     }
 
     // 7) 可选开机自启（HKCU Run，用户级，卸载一键清除）
