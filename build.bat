@@ -70,8 +70,12 @@ rem /utf-8 必加：源码是 UTF-8，若不声明，MSVC 会按本地代码页�
 rem 结果不只是中文注释变乱码，L"中文" 这类宽字符串字面量会直接编错。
 rem WINVER/_WIN32_WINNT 也要显式给：winhttp.h 里
 rem WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 这类枚举被版本宏保护，不给就找不到。
+rem 必须是 c++20 而不是 c++17：c++17 下 C++/WinRT 会去包含 <experimental/coroutine>，
+rem 而新版 MSVC STL 已经把它标记为待移除（报 C2338/STL1011）。c++20 走 <coroutine>。
+rem 那个 _SILENCE_... 宏是第二道保险，万一某版头文件仍走老路径也不至于编不过。
 set "CFLAGS=/nologo /O2 /MT /DNDEBUG /DWIN32 /D_WINDOWS /W3 /utf-8"
-set "CXXFLAGS=%CFLAGS% /std:c++17 /EHsc /DUNICODE /D_UNICODE /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00"
+set "CXXFLAGS=%CFLAGS% /std:c++20 /EHsc /DUNICODE /D_UNICODE /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00"
+set "CXXFLAGS=%CXXFLAGS% /D_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS"
 rem 用 -I 而不是 /I，避免 set "..." 里再套引号；SDK 路径含空格，必须带引号
 set "INC=-Isrc -Ithird_party\minhook\include -I"%SDKROOT%""
 
