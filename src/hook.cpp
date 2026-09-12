@@ -210,6 +210,8 @@ static std::atomic<int> g_logPath{0};
 // 不能拿 g_logApplied 来判（那个只在"真的写进去了"时才自增）：一旦某一帧没写，
 // 条件会一直成立，这行就会每帧刷一条。改成"值变了才打，且最多 6 条"。
 static std::atomic<int> g_logWant{0};
+// "按钮数是从哪数出来的"只打一条
+static std::atomic<int> g_logCount{0};
 
 // ---------------------------------------------------------------------------
 //  两条路径：Windows 有两套任务栏标签实现，按钮内部结构完全不同，必须分别处理。
@@ -290,7 +292,7 @@ static bool ApplyWidthLabelGrid(FrameworkElement const& buttonElement,
 }
 
 // ---------------------------------------------------------------------------
-//  按钮计数（兜底方案；首选见下面的 CountButtonsInRepeater）
+//  按钮计数（兜底方案；首选见下面的 CountTaskbarButtons）
 //
 //  预留的空白要按按钮数分摊成"每个按钮让出多少"，所以需要知道当前有几个按钮。
 //  这里用最朴素的办法：任务栏每次重排都会对每个按钮调用一次 UpdateButtonPadding，
@@ -325,35 +327,45 @@ static int NoteButton(void* pThis) {
 }
 
 // ---------------------------------------------------------------------------
-//  直接问系统：任务栏上现在有几个按钮
+//  直接数：任务栏上现在有几个按钮
 //
-//  按钮都装在一个 ItemsRepeater 里（本机叫 TaskbarFrameRepeater），读它的
-//  ItemsSourceView().Count() 就是按钮数。这是系统自己的账，比我们数钩子调用
-//  靠谱得多，尤其是刚注入的那几秒。
-//  找不到 repeater 或属性读取抛异常时返回 0，调用方会退回 NoteButton。
+//  按钮都装在一个容器里（真机上按钮的直接父级叫 TaskbarFrameRepeater），
+//  数它的子元素个数就是按钮数。这比我们数钩子调用靠谱得多，尤其是刚注入的
+//  那几秒 —— 那时任务栏还没布局完，兜底方案只能见到 1 个按钮。
 //
-//  注意：不要拿祖先的 ActualWidth 当"按钮区可用宽度"用。真机日志显示这条链上是
-//  TaskbarFrameRepeater / RootGrid / TaskbarFrame，宽度全是 1920（整屏宽），
-//  跟按钮区可用宽度毫无关系 —— v0.2.1 就是栽在这里。
+//  两个坑，都踩过：
+//   1) 不要拿 winrt::Windows::UI::Xaml::Controls::ItemsRepeater 去 try_as。
+//      那是 WinUI 2（Microsoft.UI.Xaml）的控件，**不在** Windows.UI.Xaml.Controls
+//      里，编译期直接 C2039（CI 上就是这么挂的）。任务栏用的是它自己的 repeater。
+//   2) 不要拿祖先的 ActualWidth 当"按钮区可用宽度"。真机日志显示这条链上是
+//      TaskbarFrameRepeater / RootGrid / TaskbarFrame，宽度全是 1920（整屏宽），
+//      跟按钮区可用宽度毫无关系 —— v0.2.1 就是栽在这里。
+//
+//  返回值 0 表示数不出来，调用方会退回 NoteButton。
 // ---------------------------------------------------------------------------
-static int CountButtonsInRepeater(FrameworkElement const& btn) {
+static int CountTaskbarButtons(FrameworkElement const& btn) {
     DependencyObject cur = btn;
-    for (int i = 0; i < 8; ++i) {
-        cur = VisualTreeHelper::GetParent(cur);
-        if (!cur) break;
-        auto rpt = cur.try_as<Controls::ItemsRepeater>();
-        if (!rpt) continue;
-        try {
-            auto view = rpt.ItemsSourceView();
-            if (view) {
-                const int n = view.Count();
-                if (n > 0) return n;
+    int firstN = 0;
+    for (int i = 0; i < 4; ++i) {
+        DependencyObject parent = VisualTreeHelper::GetParent(cur);
+        if (!parent) break;
+        const int n = VisualTreeHelper::GetChildrenCount(parent);
+        if (i == 0) firstN = n;
+        // 第一个"装了好几个子元素"的祖先就是按钮条。上限 64 是防呆：
+        // 万一某层祖先其实是个装了一大堆东西的布局根，就别认它。
+        if (n >= 2 && n <= 64) {
+            if (g_logCount.fetch_add(1) < 1) {
+                winrt::hstring nm;
+                if (auto pfe = parent.try_as<FrameworkElement>()) nm = pfe.Name();
+                LogLine(L"[i] 按钮数: 直接父级「%s」有 %d 个子元素",
+                        nm.empty() ? L"(无名)" : nm.c_str(), n);
             }
-        } catch (...) {
-            // 布局过渡期读 XAML 属性可能抛异常，当作读不到处理
+            return n;
         }
+        cur = parent;
     }
-    return 0;
+    // 只找到一层、且它只有 1 个子元素（只有一个窗口时就是这样）
+    return (firstN >= 1 && firstN <= 64) ? firstN : 0;
 }
 
 // 找一个按钮上次被我们写成了多少；没有就新建一格
@@ -379,9 +391,15 @@ static TeqwApplied* FindAppliedSlot(void* pThis) {
 //  两次探测之间隔 TEQW_PROBE_DELAY_MS，且目标一变就重新计时，这样读到的永远
 //  是"动画早已结束"的稳态值。v0.2 那个把动画中间帧当成系统写入值的死循环
 //  （实测每秒几十轮）就是这么绕开的：不是靠比大小，而是靠"写一次 + 等够了再读"。
+//
+//  另一个前提：按钮数必须先确认。标定公式里 avail = 实际渲染宽 × 按钮数，
+//  按钮数错一个，可用宽度就跟着错，接着每个按钮的宽度全错。
 // ---------------------------------------------------------------------------
-static void ProbeAvailable(FrameworkElement const& btn, int count, double want) {
-    if (count < 1) return;
+static void ProbeAvailable(FrameworkElement const& btn, int count, double want,
+                           bool countSettled) {
+    // 按钮数不可靠时绝不标定：标定公式是 avail = 实际渲染宽 × 按钮数，
+    // 按钮数错一个，可用宽度就跟着错，接着每个按钮的宽度全错。
+    if (!countSettled || count < 2) return;
     const DWORD now = GetTickCount();
 
     // 目标或按钮数变了 -> 动画会重新开始，重新计时
@@ -446,15 +464,17 @@ static void ApplyFixedWidthToButton(void* pThis) {
     const bool unloading = g_unloading.load();
     if (!unloading && g_firstCallTick == 0) g_firstCallTick = GetTickCount();
 
-    // 按钮数：先问系统（repeater 的项数），问不到再用"见过的按钮对象数"兜底。
+    // 按钮数：先数按钮容器的子元素个数，数不出来再用"见过的按钮对象数"兜底。
     // 兜底那条在刚注入时不可靠（第一轮只见到 1 个按钮），所以按钮数没确认之前
     // 不扣留白 —— 否则 预留/1 会把第一个按钮压到 56 DIP（真机日志里的现象）。
     int  count        = 1;
     bool countSettled = false;
     if (!unloading) {
-        int fromRepeater = CountButtonsInRepeater(buttonElement);
-        if (fromRepeater > 0) {
-            count        = fromRepeater;
+        const int fromContainer = CountTaskbarButtons(buttonElement);
+        if (fromContainer >= 2) {
+            // 数到 2 个以上才敢确信这就是按钮条。只数到 1 时，既可能是"按钮外面
+            // 还包了一层"、也可能真的只有一个窗口，两种情况都不能拿来算宽度。
+            count        = fromContainer;
             countSettled = true;
         } else {
             count        = NoteButton(pThis);
@@ -472,7 +492,11 @@ static void ApplyFixedWidthToButton(void* pThis) {
         double perButton = (g_available > 0.0) ? (g_available / count) : maxW;
         if (perButton > maxW) perButton = maxW;   // 按钮很少时不要超出上限
 
-        const double reserve = countSettled
+        // 只有"可用宽度已经标定出来"才需要扣留白 —— 标定出来的前提正是按钮被
+        // 系统压缩过、也就是真的铺满了任务栏。没标定说明按钮根本没占满，右侧
+        // 本来就有空档；这时候硬扣留白会把按钮压得过窄（只有一个窗口时
+        // 会算出 176 - 120 = 56 DIP，正是真机日志里那个数）。
+        const double reserve = (countSettled && g_available > 0.0)
                                    ? static_cast<double>(g_reserved.load())
                                    : 0.0;
         want = perButton - reserve / count;
@@ -484,14 +508,14 @@ static void ApplyFixedWidthToButton(void* pThis) {
         if (std::fabs(want - g_lastLoggedWant) > 0.5 && g_logWant.fetch_add(1) < 6) {
             g_lastLoggedWant = want;
             LogLine(L"[i] 宽度: 可用=%s 按钮数=%d(%s) 预留=%.0f -> 每个按钮 %.1f DIP",
-                    g_available > 0.0 ? L"已标定" : L"未标定(先用上限)",
-                    count, countSettled ? L"已确认" : L"未稳定暂不扣留白",
+                    g_available > 0.0 ? L"已标定" : L"未标定(按钮未占满，不扣留白)",
+                    count, countSettled ? L"已确认" : L"未稳固",
                     reserve, want);
         }
 
         // 探测放在写入之前调用：它只是登记"我要写多少"，然后过 2 秒
         // （动画肯定跑完了）再读回实际渲染宽度。见 ProbeAvailable。
-        ProbeAvailable(buttonElement, count, want);
+        ProbeAvailable(buttonElement, count, want, countSettled);
     }
 
     // 先判断本机走哪条路径，并把结论写进日志（只写一次）。
