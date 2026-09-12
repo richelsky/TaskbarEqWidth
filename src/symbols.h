@@ -16,6 +16,8 @@ namespace teqw {
 
 // 在 mod 模块内按通配符（如 L"*UpdateButtonPadding*"）查找第一个匹配的函数地址。
 // cacheDir 用于存放下载的 PDB。返回 nullptr 表示未找到。
-void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir);
+// err（可选）会收到失败原因，便于写日志定位到底是哪一步断了。
+void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir,
+                    std::wstring* err = nullptr);
 
 }  // namespace teqw

@@ -31,6 +31,9 @@
 #include <MinHook.h>
 
 #include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <limits>
 #include <string>
 #include <string_view>
@@ -70,6 +73,50 @@ static UpdateButtonPadding_t      g_origUpdateButtonPadding = nullptr;
 static std::wstring               g_selfDir;
 
 // ---------------------------------------------------------------------------
+//  日志：写在 DLL 自己所在目录下的 hook.log
+//
+//  为什么需要它：钩子失败的原因可能有好几种（找不到 DLL、PDB 下不来、
+//  符号名变了、杀软拦了 CreateRemoteThread），而 explorer 里没人能告诉你。
+//  写成一个普通文本文件，卸载时随目录一起删除，不留残留物。
+//  只在初始化/卸载这种一次性路径上调用，不进热路径。
+// ---------------------------------------------------------------------------
+static void LogReset() {
+    if (g_selfDir.empty()) return;
+    std::wstring p = g_selfDir + L"\\hook.log";
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+}
+
+static void LogLine(const wchar_t* fmt, ...) {
+    if (g_selfDir.empty()) return;
+    std::wstring p = g_selfDir + L"\\hook.log";
+    HANDLE h = CreateFileW(p.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    wchar_t line[1024];
+    int n = swprintf_s(line, L"[%02u:%02u:%02u.%03u] ", st.wHour, st.wMinute,
+                       st.wSecond, st.wMilliseconds);
+
+    va_list ap;
+    va_start(ap, fmt);
+    int m = _vsnwprintf_s(line + n, 1024 - static_cast<size_t>(n), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    if (m < 0) m = 0;
+    n += m;
+    if (n > 1020) n = 1020;
+    line[n++] = L'\r';
+    line[n++] = L'\n';
+
+    DWORD written = 0;
+    WriteFile(h, line, static_cast<DWORD>(n * sizeof(wchar_t)), &written, nullptr);
+    CloseHandle(h);
+}
+
+// ---------------------------------------------------------------------------
 //  XAML 辅助：按名字在可视化树里找子元素
 // ---------------------------------------------------------------------------
 static FrameworkElement FindChildByName(DependencyObject const& root,
@@ -100,18 +147,39 @@ static void ApplyFixedWidthToButton(void* pThis) {
     auto iconPanel = FindChildByName(buttonElement, L"IconPanel");
     if (!iconPanel) return;
 
-    if (g_unloading.load()) {
-        // 卸载中：恢复成系统原生（NaN = 自动计算）
-        iconPanel.Width(std::numeric_limits<double>::quiet_NaN());
-    } else {
-        iconPanel.Width(static_cast<double>(g_itemWidth.load()));
+    // 目标值：卸载中则恢复成 NaN（= 交还系统按内容自动计算）
+    double want = g_unloading.load()
+                      ? std::numeric_limits<double>::quiet_NaN()
+                      : static_cast<double>(g_itemWidth.load());
+
+    // 值没变就不写。XAML 属性写入会触发一次布局，而布局又会回调本函数，
+    // 这里过滤掉无效写入，可以少掉大量无谓的重排。
+    double cur = iconPanel.Width();
+    bool same = (cur == want) ||
+                (std::isnan(cur) && std::isnan(want));
+    if (!same) {
+        iconPanel.Width(want);
     }
 }
 
 // ---------------------------------------------------------------------------
 //  钩子函数
+//
+//  重入保护：改宽度会让 XAML 重新布局，而重新布局又会调用 UpdateButtonPadding，
+//  也就是再次进入我们这个钩子。Windhawk 那个模块同样加了这类保护，并注明
+//  "Without it, there's an infinite rerendering loop"。这里用原子量做闸门
+//  （XAML 布局是单线程的，原子量足够，而且不像 thread_local 那样在 DLL 卸载时
+//   需要跑析构，注入场景下更安全）。
 // ---------------------------------------------------------------------------
+static std::atomic<bool> g_inHook{false};
+
 static void WINAPI Hook_UpdateButtonPadding(void* pThis) {
+    if (g_inHook.exchange(true)) {
+        // 重入：只放行原函数，不再改宽度
+        g_origUpdateButtonPadding(pThis);
+        return;
+    }
+
     g_origUpdateButtonPadding(pThis);
 
     try {
@@ -119,6 +187,8 @@ static void WINAPI Hook_UpdateButtonPadding(void* pThis) {
     } catch (...) {
         // 任务栏布局过渡期可能抛 WinRT 异常，吞掉，绝不能让它冒泡回 explorer
     }
+
+    g_inHook.store(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +274,14 @@ static void RestoreAndUnhook() {
 //  初始化线程（不能占用 loader lock，所以放在独立线程里做）
 // ---------------------------------------------------------------------------
 static DWORD WINAPI InitThread(LPVOID) {
+    LogReset();
+    LogLine(L"=== TaskbarEqWidth 钩子已注入 explorer.exe (PID %lu) ===",
+            GetCurrentProcessId());
+    LogLine(L"DLL 目录: %s", g_selfDir.c_str());
+
     CreateMsgHostWindow();
     LoadConfig();
+    LogLine(L"配置的按钮宽度: %d DIP", g_itemWidth.load());
 
     g_evUnload = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_UNLOAD);
     g_evInitDone = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_INITDONE);
@@ -226,31 +302,60 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     // ---- 定位并挂钩 --------------------------------------------------------
     HMODULE taskbarView = WaitForTaskbarViewDll(30000);
-    if (taskbarView) {
+    if (!taskbarView) {
+        LogLine(L"[x] 30 秒内没找到 Taskbar.View.dll / ExplorerExtensions.dll");
+        LogLine(L"    可能这台机器的任务栏 UI 由别的模块实现，或版本差异较大。");
+    } else {
+        wchar_t modPath[MAX_PATH]{};
+        GetModuleFileNameW(taskbarView, modPath, MAX_PATH);
+        LogLine(L"Taskbar.View.dll: base=%p  path=%s",
+                reinterpret_cast<void*>(taskbarView), modPath);
+
         std::wstring cacheDir = g_selfDir + L"\\symbols";
         std::wstring pdbPath = cacheDir + L"\\Taskbar.View.pdb";
-        g_statusFromCache =
-            (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES) ? 1 : 0;
+        bool cached = (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+        g_statusFromCache = cached ? 1 : 0;
+        LogLine(L"PDB 缓存: %s", cached ? L"已有，直接使用" : L"没有，需要联网下载");
 
-        g_target = teqw::ResolveSymbol(taskbarView, L"*UpdateButtonPadding*", cacheDir);
+        std::wstring err;
+        g_target = teqw::ResolveSymbol(taskbarView, L"*UpdateButtonPadding*", cacheDir, &err);
+        if (!g_target) {
+            LogLine(L"[x] 符号定位失败: %s", err.c_str());
+            LogLine(L"    这个私有函数名可能在本机 Windows 版本上变了。");
+        } else {
+            LogLine(L"已定位 UpdateButtonPadding @ %p", g_target);
 
-        if (g_target && MH_Initialize() == MH_OK) {
-            if (MH_CreateHook(g_target,
-                              reinterpret_cast<LPVOID>(&Hook_UpdateButtonPadding),
-                              reinterpret_cast<LPVOID*>(&g_origUpdateButtonPadding)) == MH_OK &&
-                MH_EnableHook(g_target) == MH_OK) {
-                if (g_pStatus) g_pStatus->hookOk = 1;
+            MH_STATUS mh = MH_Initialize();
+            LogLine(L"MH_Initialize -> %d", static_cast<int>(mh));
+            if (mh == MH_OK) {
+                MH_STATUS c = MH_CreateHook(g_target,
+                                            reinterpret_cast<LPVOID>(&Hook_UpdateButtonPadding),
+                                            reinterpret_cast<LPVOID*>(&g_origUpdateButtonPadding));
+                LogLine(L"MH_CreateHook -> %d", static_cast<int>(c));
+                if (c == MH_OK) {
+                    MH_STATUS e = MH_EnableHook(g_target);
+                    LogLine(L"MH_EnableHook -> %d", static_cast<int>(e));
+                    if (e == MH_OK) {
+                        if (g_pStatus) g_pStatus->hookOk = 1;
+                        LogLine(L"[OK] 钩子已生效，任务栏按钮宽度将被固定为 %d",
+                                g_itemWidth.load());
+                    }
+                }
             }
         }
     }
 
     if (g_pStatus) g_pStatus->fromCache = g_statusFromCache;
+    LogLine(L"--- 初始化结束 (hookOk=%lu) ---",
+            g_pStatus ? g_pStatus->hookOk : 0UL);
     if (g_evInitDone) SetEvent(g_evInitDone);
 
     // ---- 常驻等待卸载指令 --------------------------------------------------
     if (g_evUnload) WaitForSingleObject(g_evUnload, INFINITE);
 
+    LogLine(L"收到卸载指令，开始恢复...");
     RestoreAndUnhook();
+    LogLine(L"钩子已撤销，宽度已交还系统原生计算");
 
     // 通知管理器：已卸载，可以删文件了
     g_evUnloaded = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_UNLOADED);
@@ -264,6 +369,8 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (g_hMapStatus) CloseHandle(g_hMapStatus);
     if (g_evUnload) CloseHandle(g_evUnload);
     if (g_evInitDone) CloseHandle(g_evInitDone);
+
+    LogLine(L"=== 即将从 explorer.exe 卸载自身 ===");
 
     // 把自己从 explorer.exe 里彻底卸掉
     FreeLibraryAndExitThread(reinterpret_cast<HMODULE>(g_hinst), 0);

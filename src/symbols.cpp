@@ -165,37 +165,76 @@ bool EnsureSymInitialized(const std::wstring& cacheDir) {
 // ---------------------------------------------------------------------------
 //  对外接口
 // ---------------------------------------------------------------------------
-void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir) {
-    if (!mod || !wildcard) return nullptr;
+void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir,
+                    std::wstring* err) {
+    auto fail = [&](const wchar_t* why, const std::wstring& detail) -> void* {
+        if (err) *err = std::wstring(why) + (detail.empty() ? L"" : L" | " + detail);
+        return nullptr;
+    };
+    if (!mod || !wildcard) return fail(L"参数无效", L"");
+    if (cacheDir.empty()) return fail(L"缓存目录为空", L"");
 
-    // 缓存目录
     CreateDirectoryW(cacheDir.c_str(), nullptr);
 
+    // 1) 从 DLL 的调试目录里读出 PDB 文件名与符号服务器用的 key
     PdbInfo pdb;
-    if (!ReadPdbInfo(mod, pdb)) return nullptr;
-
-    // 已缓存就直接用，不重复下载
-    std::wstring pdbPath = cacheDir + L"\\" + pdb.name;
-    if (GetFileAttributesW(pdbPath.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        std::wstring url = L"/download/symbols/" + pdb.name + L"/" + pdb.key + L"/" + pdb.name;
-        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath)) return nullptr;
+    if (!ReadPdbInfo(mod, pdb)) {
+        return fail(L"读不出 DLL 的 PDB 信息（调试目录缺失或不是 RSDS 格式）", L"");
     }
 
-    if (!EnsureSymInitialized(cacheDir)) return nullptr;
+    // 2) 该 PDB 若未缓存就先下载（这个 DLL 的 PDB 有数十 MB，首次会慢）
+    std::wstring pdbPath = cacheDir + L"\\" + pdb.name;
+    bool fromCache = (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    if (!fromCache) {
+        std::wstring url = L"/download/symbols/" + pdb.name + L"/" + pdb.key + L"/" + pdb.name;
+        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath)) {
+            return fail(L"PDB 下载失败（网络不通或符号服务器拒绝）", pdb.name);
+        }
+    }
+
+    if (!EnsureSymInitialized(cacheDir)) {
+        return fail(L"SymInitialize 初始化失败", cacheDir);
+    }
+
+    // 3) 告诉 dbghelp 这个模块在内存里的基址，让它去 cacheDir 里找符号。
+    //    注意 ImageName 传的是 **DLL 自己的路径**而不是 PDB 路径：
+    //    dbghelp 会自己读 DLL 的调试目录算出 PDB 名与 key，再到搜索路径里取，
+    //    这是最标准、最不容易出错的方式（PDB 路径那种写法只是后备）。
+    wchar_t modPath[MAX_PATH]{};
+    if (GetModuleFileNameW(mod, modPath, MAX_PATH) == 0) {
+        modPath[0] = 0;
+    }
 
     // 先卸载同基址的旧记录，避免重复加载
     SymUnloadModule64(GetCurrentProcess(), reinterpret_cast<DWORD64>(mod));
 
     MODULEINFO mi{};
-    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) return nullptr;
+    if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) {
+        return fail(L"GetModuleInformation 失败", L"");
+    }
 
-    DWORD64 symBase = SymLoadModuleExW(GetCurrentProcess(), nullptr, pdbPath.c_str(), nullptr,
-                                       reinterpret_cast<DWORD64>(mi.lpBaseOfDll),
-                                       mi.SizeOfImage, nullptr, 0);
-    if (symBase == 0) return nullptr;
+    DWORD64 symBase = 0;
+    if (modPath[0]) {
+        symBase = SymLoadModuleExW(GetCurrentProcess(), nullptr, modPath, nullptr,
+                                   reinterpret_cast<DWORD64>(mi.lpBaseOfDll),
+                                   mi.SizeOfImage, nullptr, 0);
+    }
+    if (symBase == 0) {
+        // 后备：直接把 PDB 文件当成 ImageName 交给 dbghelp
+        symBase = SymLoadModuleExW(GetCurrentProcess(), nullptr, pdbPath.c_str(), nullptr,
+                                   reinterpret_cast<DWORD64>(mi.lpBaseOfDll),
+                                   mi.SizeOfImage, nullptr, 0);
+    }
+    if (symBase == 0) {
+        return fail(L"SymLoadModuleEx 失败（PDB 与模块不匹配或 PDB 损坏）", pdb.name);
+    }
 
     FindCtx ctx;
-    if (!SymEnumSymbolsW(GetCurrentProcess(), symBase, wildcard, EnumCallback, &ctx)) {
+    if (!SymEnumSymbolsW(GetCurrentProcess(), symBase, wildcard, EnumCallback, &ctx) || !ctx.found) {
+        if (err) {
+            *err = std::wstring(L"在 PDB 里没找到匹配的符号: ") + wildcard;
+            *err += fromCache ? L"（用的是本地缓存）" : L"（刚下载）";
+        }
         return nullptr;
     }
     return ctx.found;

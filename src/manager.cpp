@@ -24,6 +24,7 @@
 
 #include <cstdio>
 #include <cstdlib>   // _wtoi
+#include <locale.h>  // setlocale
 #include <string>
 #include <string.h>  // _wcsicmp
 #include <wchar.h>
@@ -59,6 +60,43 @@ static std::wstring GetInstallDir() {
 
 static bool FileExists(const std::wstring& p) {
     return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES;
+}
+
+// 打印钩子 DLL 写的 hook.log 末尾片段（UTF-16LE）。
+// 钩子失败时，这是唯一能说明「卡在哪一步」的东西。
+static void PrintHookLogTail(int maxLines) {
+    std::wstring p = GetInstallDir() + L"\\hook.log";
+    if (!FileExists(p)) {
+        wprintf(L"     (没有 hook.log，说明 DLL 可能根本没被载入 explorer)\n");
+        return;
+    }
+    HANDLE h = CreateFileW(p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return;
+
+    LARGE_INTEGER sz{};
+    GetFileSizeEx(h, &sz);
+    DWORD toRead = static_cast<DWORD>(sz.QuadPart > 32768 ? 32768 : sz.QuadPart);
+    std::wstring buf(toRead / sizeof(wchar_t), L'\0');
+    SetFilePointer(h, -static_cast<LONG>(toRead), nullptr, FILE_END);
+    DWORD got = 0;
+    if (!ReadFile(h, &buf[0], toRead, &got, nullptr)) got = 0;
+    CloseHandle(h);
+    buf.resize(got / sizeof(wchar_t));
+
+    // 只保留末尾 maxLines 行
+    int total = 0;
+    for (wchar_t c : buf) if (c == L'\n') ++total;
+    if (total > maxLines) {
+        int skip = total - maxLines, seen = 0;
+        size_t i = 0;
+        for (; i < buf.size(); ++i) {
+            if (buf[i] == L'\n' && ++seen > skip) { ++i; break; }
+        }
+        buf.erase(0, i);
+    }
+    wprintf(L"%s", buf.c_str());
+    if (!buf.empty() && buf.back() != L'\n') wprintf(L"\n");
 }
 
 static void EnableDebugPrivilege() {
@@ -366,8 +404,10 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
             wprintf(L"     卸载命令: \"%s\" --uninstall\n", targetExe.c_str());
         } else {
             wprintf(L"[!] 已注入，但未能挂上钩子。\n");
-            wprintf(L"    可能原因：杀毒软件拦截、Windows 版本不被支持、或网络不通导致\n");
-            wprintf(L"    符号下载失败。请查看安装目录下的 symbols\\ 是否生成了 PDB。\n");
+            wprintf(L"    钩子自己记录了失败原因：\n\n");
+            PrintHookLogTail(30);
+            wprintf(L"\n    日志文件: %s\\hook.log\n", installDir.c_str());
+            wprintf(L"    卸载:     \"%s\" --uninstall\n", targetExe.c_str());
         }
     }
     return ok ? 0 : 2;
@@ -424,9 +464,10 @@ static int DoUninstall(bool keepFiles, bool quiet) {
     if (keepFiles) {
         if (!quiet) wprintf(L"      已保留: %s\n", installDir.c_str());
     } else if (safeToDelete) {
-        // 先删 PDB 缓存和 DLL，再删 EXE（正在运行的 exe 删不掉，交给最后一步）
+        // 先删 PDB 缓存、日志和 DLL，再删 EXE（正在运行的 exe 删不掉，交给最后一步）
         DeleteFileW((installDir + L"\\symbols\\Taskbar.View.pdb").c_str());
         RemoveDirectoryW((installDir + L"\\symbols").c_str());
+        DeleteFileW((installDir + L"\\hook.log").c_str());
         DeleteFileW((installDir + L"\\" + TEQW_HOOK_DLL_NAME).c_str());
         DeleteFileW((installDir + L"\\" + TEQW_MANAGER_EXE_NAME).c_str());
         RemoveDirectoryW(installDir.c_str());
@@ -505,6 +546,13 @@ static int DoStatus() {
         RegCloseKey(hKey);
     }
     wprintf(L"开机自启             : %s\n", autostart ? L"已启用" : L"未启用");
+    wprintf(L"钩子日志             : %s\n",
+            FileExists(installDir + L"\\hook.log") ? L"存在（见下方）" : L"无");
+
+    if (!IsDllResident()) {
+        wprintf(L"\n提示：DLL 当前不在 explorer 里，所以宽度已是系统原生值。\n");
+    }
+    PrintHookLogTail(30);
     return 0;
 }
 
@@ -551,6 +599,21 @@ static int DoVerify() {
 //  入口
 // ---------------------------------------------------------------------------
 int wmain(int argc, wchar_t** argv) {
+    // ---- 让中文在 cmd / PowerShell / 管道里都能正确输出 ----
+    // UCRT 默认 locale 是 "C"，wprintf 把宽字符转成多字节时会失败并截断输出，
+    // 现象就是"英文还在、中文全没了"。两件事缺一不可：
+    //   1) CRT locale 设为 UTF-8  —— 让 宽字符 -> 字节 的转换真正发生
+    //   2) 控制台输出代码页设为 UTF-8 —— 让 cmd 按 UTF-8 解释这些字节
+    // 老系统没有 ".UTF-8"（Win10 1803 之前）时退回系统 ANSI 代码页（中文系统即 GBK）。
+    bool utf8 = (setlocale(LC_ALL, ".UTF-8") != nullptr);
+    UINT cp = CP_UTF8;
+    if (!utf8) {
+        setlocale(LC_ALL, "");
+        cp = GetACP();
+    }
+    SetConsoleOutputCP(cp);
+    SetConsoleCP(cp);
+
     DWORD width = TEQW_DEFAULT_WIDTH;
     bool autostart = false;
     bool quiet = false;
