@@ -34,7 +34,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
-#include <string_view>
+#include <wchar.h>
 
 #include "shared.h"
 #include "symbols.h"
@@ -47,7 +47,10 @@ using namespace winrt::Windows::UI::Xaml::Media;
 // ---------------------------------------------------------------------------
 //  全局状态
 // ---------------------------------------------------------------------------
-static HMODULE                    g_hinst          = nullptr;
+// 注意类型：HINSTANCE 与 HMODULE 在 C++ 里是两个不同的类型，MSVC 不会隐式转换。
+// 窗口类注册/创建要 HINSTANCE，GetModuleFileNameW/FreeLibrary 要 HMODULE，
+// 所以这里存 HINSTANCE，用到 HMODULE 的地方显式 reinterpret_cast。
+static HINSTANCE                  g_hinst          = nullptr;
 static std::atomic<bool>          g_unloading{false};
 static std::atomic<int>           g_itemWidth{TEQW_DEFAULT_WIDTH};
 static DWORD                      g_statusFromCache = 0;
@@ -263,7 +266,7 @@ static DWORD WINAPI InitThread(LPVOID) {
     if (g_evInitDone) CloseHandle(g_evInitDone);
 
     // 把自己从 explorer.exe 里彻底卸掉
-    FreeLibraryAndExitThread(g_hinst, 0);
+    FreeLibraryAndExitThread(reinterpret_cast<HMODULE>(g_hinst), 0);
     return 0;
 }
 
@@ -276,7 +279,7 @@ BOOL WINAPI DllMain(HINSTANCE hinst, DWORD reason, LPVOID) {
         DisableThreadLibraryCalls(hinst);
 
         wchar_t path[MAX_PATH]{};
-        GetModuleFileNameW(hinst, path, MAX_PATH);
+        GetModuleFileNameW(reinterpret_cast<HMODULE>(hinst), path, MAX_PATH);
         g_selfDir = path;
         size_t slash = g_selfDir.find_last_of(L'\\');
         if (slash != std::wstring::npos) g_selfDir.resize(slash);

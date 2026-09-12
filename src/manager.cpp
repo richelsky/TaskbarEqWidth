@@ -25,6 +25,8 @@
 #include <cstdio>
 #include <cstdlib>   // _wtoi
 #include <string>
+#include <string.h>  // _wcsicmp
+#include <wchar.h>
 
 #include "shared.h"
 

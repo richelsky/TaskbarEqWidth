@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <wchar.h>
 
 #pragma comment(lib, "dbghelp.lib")
 #pragma comment(lib, "psapi.lib")
@@ -129,12 +130,15 @@ struct FindCtx {
     void* found = nullptr;
 };
 
-BOOL CALLBACK EnumCallback(PSYMBOL_INFO info, ULONG /*symbolSize*/, PVOID context) {
+// 显式用宽字符版本（PSYMBOL_INFOW / SymEnumSymbolsW / SymInitializeW）。
+// 用 PSYMBOL_INFO 这种 UNICODE 别名虽然通常也对，但别名映射是头文件的实现细节，
+// 依赖它一旦踩空就是一堆类型不匹配的报错。PDB 里的符号名是 ASCII，用宽字符比较无碍。
+BOOL CALLBACK EnumCallback(PSYMBOL_INFOW info, ULONG /*symbolSize*/, PVOID context) {
     auto* ctx = reinterpret_cast<FindCtx*>(context);
-    const char* n = info->Name;
+    const wchar_t* n = info->Name;
     // 跳过编译器生成的胶水代码，只取真正的实现函数
-    if (strstr(n, "dtor$") || strstr(n, "thunk") || strstr(n, "Adjustor") ||
-        strstr(n, "vftable") || strstr(n, "catch$")) {
+    if (wcsstr(n, L"dtor$") || wcsstr(n, L"thunk") || wcsstr(n, L"Adjustor") ||
+        wcsstr(n, L"vftable") || wcsstr(n, L"catch$")) {
         return TRUE;
     }
     ctx->found = reinterpret_cast<void*>(info->Address);
@@ -149,7 +153,7 @@ bool EnsureSymInitialized(const std::wstring& cacheDir) {
 
     if (!s_inited) {
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_NO_PROMPTS);
-        if (!SymInitialize(GetCurrentProcess(), cacheDir.c_str(), FALSE)) return false;
+        if (!SymInitializeW(GetCurrentProcess(), cacheDir.c_str(), FALSE)) return false;
         s_inited = true;
         s_dir = cacheDir;
     }
@@ -185,13 +189,13 @@ void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& ca
     MODULEINFO mi{};
     if (!GetModuleInformation(GetCurrentProcess(), mod, &mi, sizeof(mi))) return nullptr;
 
-    DWORD64 symBase = SymLoadModuleEx(GetCurrentProcess(), nullptr, pdbPath.c_str(), nullptr,
-                                      reinterpret_cast<DWORD64>(mi.lpBaseOfDll),
-                                      mi.SizeOfImage, nullptr, 0);
+    DWORD64 symBase = SymLoadModuleExW(GetCurrentProcess(), nullptr, pdbPath.c_str(), nullptr,
+                                       reinterpret_cast<DWORD64>(mi.lpBaseOfDll),
+                                       mi.SizeOfImage, nullptr, 0);
     if (symBase == 0) return nullptr;
 
     FindCtx ctx;
-    if (!SymEnumSymbols(GetCurrentProcess(), symBase, wildcard, EnumCallback, &ctx)) {
+    if (!SymEnumSymbolsW(GetCurrentProcess(), symBase, wildcard, EnumCallback, &ctx)) {
         return nullptr;
     }
     return ctx.found;

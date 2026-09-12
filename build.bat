@@ -49,8 +49,16 @@ echo     使用: %VCVARS%
 call "%VCVARS%" >nul
 if errorlevel 1 goto :err_vcvars
 
+rem --- 定位 C++/WinRT 头文件：先按 vcvars 给的版本，找不到就扫描所有 SDK 版本 ---
 set "SDKROOT=%WindowsSdkDir%Include\%WindowsSDKLibVersion%cppwinrt"
-if not exist "%SDKROOT%\winrt\Windows.Foundation.h" goto :err_nosdk
+if exist "%SDKROOT%\winrt\Windows.Foundation.h" goto :sdk_ok
+set "SDKROOT="
+rem 注意 %%~D 而不是 %%D：for 会给变量带上引号，%~ 才能去掉
+for /d %%D in ("%WindowsSdkDir%Include\*") do (
+  if exist "%%~D\cppwinrt\winrt\Windows.Foundation.h" set "SDKROOT=%%~D\cppwinrt"
+)
+:sdk_ok
+if not defined SDKROOT goto :err_nosdk
 
 if not exist bin mkdir bin
 if not exist obj mkdir obj
@@ -58,9 +66,14 @@ if not exist obj\mh mkdir obj\mh
 
 rem MinHook 的 hook.c 会生成 hook.obj，与我们的 hook.cpp 同名，
 rem 所以两批目标文件分开输出到 obj\mh\ 和 obj\，避免互相覆盖。
-set "CFLAGS=/nologo /O2 /MT /DNDEBUG /DWIN32 /D_WINDOWS /W3"
-set "CXXFLAGS=%CFLAGS% /std:c++17 /EHsc /DUNICODE /D_UNICODE"
-set "INC=/I"src" /I"third_party\minhook\include" /I"%SDKROOT%""
+rem /utf-8 必加：源码是 UTF-8，若不声明，MSVC 会按本地代码页解析，
+rem 结果不只是中文注释变乱码，L"中文" 这类宽字符串字面量会直接编错。
+rem WINVER/_WIN32_WINNT 也要显式给：winhttp.h 里
+rem WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY 这类枚举被版本宏保护，不给就找不到。
+set "CFLAGS=/nologo /O2 /MT /DNDEBUG /DWIN32 /D_WINDOWS /W3 /utf-8"
+set "CXXFLAGS=%CFLAGS% /std:c++17 /EHsc /DUNICODE /D_UNICODE /DWINVER=0x0A00 /D_WIN32_WINNT=0x0A00"
+rem 用 -I 而不是 /I，避免 set "..." 里再套引号；SDK 路径含空格，必须带引号
+set "INC=-Isrc -Ithird_party\minhook\include -I"%SDKROOT%""
 
 echo.
 echo === [2/4] 编译 MinHook（第三方钩子库，MIT 许可）===
