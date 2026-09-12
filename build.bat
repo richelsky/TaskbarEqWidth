@@ -93,10 +93,13 @@ echo === [3/4] 编译注入 DLL（TaskbarEqWidthHook.dll）===
 cl %CXXFLAGS% %INC% /c /Foobj\ src\hook.cpp src\symbols.cpp
 if errorlevel 1 goto :err_dllobj
 
+rem user32.lib 不能少：windowsapp.lib 只覆盖 WinRT 与部分 API set，
+rem CreateWindowExW / FindWindowW / DefWindowProcW 这类窗口与消息函数都在 user32 里。
 link /nologo /DLL /OUT:bin\TaskbarEqWidthHook.dll /MACHINE:X64 ^
    obj\hook.obj obj\symbols.obj ^
    obj\mh\hook.obj obj\mh\buffer.obj obj\mh\trampoline.obj obj\mh\hde64.obj ^
-   windowsapp.lib runtimeobject.lib dbghelp.lib winhttp.lib psapi.lib ole32.lib oleaut32.lib
+   user32.lib advapi32.lib ole32.lib oleaut32.lib ^
+   windowsapp.lib runtimeobject.lib dbghelp.lib winhttp.lib psapi.lib
 if errorlevel 1 goto :err_dlllink
 
 echo.
@@ -104,8 +107,9 @@ echo === [4/4] 编译管理器 EXE（TaskbarEqWidth.exe）===
 cl %CXXFLAGS% %INC% /c /Foobj\ src\manager.cpp
 if errorlevel 1 goto :err_exeobj
 
+rem 同上：FindWindowW / GetWindowThreadProcessId 也在 user32.lib
 link /nologo /OUT:bin\TaskbarEqWidth.exe /MACHINE:X64 /SUBSYSTEM:CONSOLE ^
-   obj\manager.obj shell32.lib advapi32.lib
+   obj\manager.obj user32.lib shell32.lib advapi32.lib
 if errorlevel 1 goto :err_exelink
 
 echo.
