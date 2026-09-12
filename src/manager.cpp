@@ -99,6 +99,14 @@ static void PrintHookLogTail(int maxLines) {
     if (!buf.empty() && buf.back() != L'\n') wprintf(L"\n");
 }
 
+// 让任务栏重排一次，DLL 会立刻用新参数重写按钮宽度（用于"改参数立即生效"）
+static void NudgeTaskbarFromManager() {
+    HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!hTray) return;
+    DWORD_PTR unused = 0;
+    SendMessageTimeoutW(hTray, WM_SETTINGCHANGE, 0, 0, SMTO_NORMAL, 1000, &unused);
+}
+
 static void EnableDebugPrivilege() {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(),
@@ -317,7 +325,7 @@ static void RestartExplorer() {
 // ---------------------------------------------------------------------------
 //  安装
 // ---------------------------------------------------------------------------
-static int DoInstall(DWORD width, bool autostart, bool quiet) {
+static int DoInstall(DWORD width, DWORD reserved, bool autostart, bool quiet) {
     std::wstring installDir = GetInstallDir();
     CreateDirectoryW(installDir.c_str(), nullptr);
     if (!FileExists(installDir)) {
@@ -364,7 +372,9 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
     // 2) 写入配置（卸载时这个键会被整体删除）
     if (width < TEQW_MIN_WIDTH) width = TEQW_MIN_WIDTH;
     if (width > TEQW_MAX_WIDTH) width = TEQW_MAX_WIDTH;
+    if (reserved > TEQW_MAX_RESERVED) reserved = TEQW_MAX_RESERVED;
     RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_WIDTH, width);
+    RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_RESERVED, reserved);
     RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_MANAGED, 1);
 
     // 3) 注入
@@ -431,7 +441,7 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
                                                           sizeof(TeqwStatus)));
         if (st && st->magic == TEQW_STATUS_MAGIC) {
             ok = st->hookOk != 0;
-            shownWidth = static_cast<int>(st->itemWidth);
+            if (st->itemWidth > 0) shownWidth = static_cast<int>(st->itemWidth);
             if (!quiet) {
                 wprintf(L"[*] 符号来源: %s\n", st->fromCache ? L"本地缓存" : L"在线下载");
             }
@@ -450,8 +460,12 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
     if (!quiet) {
         wprintf(L"\n");
         if (ok) {
-            wprintf(L"[OK] 已生效 —— 任务栏按钮宽度统一为 %d\n", shownWidth);
+            wprintf(L"[OK] 已生效 —— 任务栏按钮等宽，每个约 %d DIP\n", shownWidth);
+            wprintf(L"     右侧留白: 约 %lu DIP（鼠标可以在那里右键出「任务栏设置」）\n",
+                    reserved);
             wprintf(L"     安装目录: %s\n", installDir.c_str());
+            wprintf(L"     调整留白: \"%s\" --reserved 160   （立即生效，无需重装）\n",
+                    targetExe.c_str());
             wprintf(L"     卸载命令: \"%s\" --uninstall\n", targetExe.c_str());
         } else {
             wprintf(L"[!] 已注入，但未能挂上钩子。\n");
@@ -507,6 +521,7 @@ static int DoUninstall(bool keepFiles, bool quiet) {
     // --- 3) 配置键 -----------------------------------------------------------
     if (!quiet) wprintf(L"[3/5] 删除注册表配置...\n");
     RegDeleteValueSafe(TEQW_REG_CFG_KEY, TEQW_REG_VAL_WIDTH);
+    RegDeleteValueSafe(TEQW_REG_CFG_KEY, TEQW_REG_VAL_RESERVED);
     RegDeleteValueSafe(TEQW_REG_CFG_KEY, TEQW_REG_VAL_MANAGED);
     RegDeleteKeySafe(TEQW_REG_CFG_KEY);
 
@@ -571,20 +586,34 @@ static int DoStatus() {
     wprintf(L"-------------------------------------------\n");
     wprintf(L"DLL 是否驻留 explorer : %s\n", IsDllResident() ? L"是（正在生效）" : L"否");
 
+    DWORD dllAvail = 0, dllCount = 0, dllWidth = 0, dllReserved = 0;
+    bool  dllOk = false;
     HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, TEQW_SHM_STATUS);
     if (hMap) {
         auto* st = static_cast<TeqwStatus*>(MapViewOfFile(hMap, FILE_MAP_READ, 0, 0,
                                                           sizeof(TeqwStatus)));
         if (st && st->magic == TEQW_STATUS_MAGIC) {
-            wprintf(L"钩子状态             : %s\n", st->hookOk ? L"已挂上" : L"未挂上");
-            wprintf(L"当前按钮宽度         : %lu\n", st->itemWidth);
+            dllOk = st->hookOk != 0;
+            dllWidth = st->itemWidth;
+            dllAvail = st->availWidth;
+            dllCount = st->buttonCount;
+            dllReserved = st->reserved;
+            wprintf(L"钩子状态             : %s\n", dllOk ? L"已挂上" : L"未挂上");
+            wprintf(L"当前每个按钮宽       : %lu DIP\n", dllWidth);
+            wprintf(L"任务栏按钮数         : %lu\n", dllCount);
+            wprintf(L"按钮区可用总宽       : %s\n",
+                    dllAvail ? std::to_wstring(dllAvail).c_str() : L"尚未标定");
+            wprintf(L"右侧实际留白         : 约 %lu DIP\n",
+                    dllCount ? dllReserved : 0UL);
         }
         if (st) UnmapViewOfFile(st);
         CloseHandle(hMap);
     }
 
     DWORD w = RegGetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_WIDTH, 0);
-    wprintf(L"配置中的宽度         : %lu\n", w);
+    DWORD r = RegGetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_RESERVED, 0);
+    wprintf(L"配置中的宽度上限     : %lu\n", w);
+    wprintf(L"配置中的预留空白     : %lu DIP\n", r);
     wprintf(L"安装目录             : %s (%s)\n", installDir.c_str(),
             FileExists(installDir) ? L"存在" : L"不存在");
 
@@ -602,6 +631,9 @@ static int DoStatus() {
 
     if (!IsDllResident()) {
         wprintf(L"\n提示：DLL 当前不在 explorer 里，所以宽度已是系统原生值。\n");
+    } else if (dllOk && dllAvail == 0) {
+        wprintf(L"\n提示：还没标定出任务栏可用宽度，说明当前按钮宽度没被系统压缩。\n");
+        wprintf(L"      打开/固定几个应用（按钮把任务栏占满）后，留白会自动生效。\n");
     }
     PrintHookLogTail(30);
     return 0;
@@ -666,6 +698,9 @@ int wmain(int argc, wchar_t** argv) {
     SetConsoleCP(cp);
 
     DWORD width = TEQW_DEFAULT_WIDTH;
+    DWORD reserved = TEQW_DEFAULT_RESERVED;
+    bool widthGiven = false;
+    bool reservedGiven = false;
     bool autostart = false;
     bool quiet = false;
     bool uninstall = false;
@@ -689,14 +724,21 @@ int wmain(int argc, wchar_t** argv) {
             quiet = true;
         } else if (_wcsicmp(a, L"--width") == 0 && i + 1 < argc) {
             width = static_cast<DWORD>(_wtoi(argv[++i]));
+            widthGiven = true;
+        } else if ((_wcsicmp(a, L"--reserved") == 0 || _wcsicmp(a, L"--reserve") == 0) &&
+                   i + 1 < argc) {
+            reserved = static_cast<DWORD>(_wtoi(argv[++i]));
+            reservedGiven = true;
         } else if (_wcsicmp(a, L"--help") == 0 || _wcsicmp(a, L"-h") == 0) {
             wprintf(L"TaskbarEqWidth —— 让 Win11 任务栏按钮等宽（保留窗口标题）\n\n");
-            wprintf(L"  TaskbarEqWidth.exe                 安装并立即生效\n");
-            wprintf(L"  TaskbarEqWidth.exe --width 200     指定按钮宽度（50-400）\n");
-            wprintf(L"  TaskbarEqWidth.exe --autostart     同时注册开机自启\n");
-            wprintf(L"  TaskbarEqWidth.exe --status        查看状态\n");
-            wprintf(L"  TaskbarEqWidth.exe --verify        扫描残留\n");
-            wprintf(L"  TaskbarEqWidth.exe --uninstall     完全卸载\n");
+            wprintf(L"  TaskbarEqWidth.exe                  安装并立即生效\n");
+            wprintf(L"  TaskbarEqWidth.exe --width 200      按钮宽度上限（50-400，默认 176）\n");
+            wprintf(L"  TaskbarEqWidth.exe --reserved 160   右侧预留空白（0-600，默认 120）\n");
+            wprintf(L"                                      已安装时只改参数，立即生效、不重装\n");
+            wprintf(L"  TaskbarEqWidth.exe --autostart      同时注册开机自启\n");
+            wprintf(L"  TaskbarEqWidth.exe --status         查看状态（含留白是否生效）\n");
+            wprintf(L"  TaskbarEqWidth.exe --verify         扫描残留\n");
+            wprintf(L"  TaskbarEqWidth.exe --uninstall      完全卸载\n");
             wprintf(L"  TaskbarEqWidth.exe --uninstall --keep-files   卸载但保留文件\n");
             return 0;
         }
@@ -707,5 +749,37 @@ int wmain(int argc, wchar_t** argv) {
     if (uninstall) return DoUninstall(keepFiles, quiet);
     if (status) return DoStatus();
     if (verify) return DoVerify();
-    return DoInstall(width, autostart, quiet);
+
+    // 已经装好、DLL 还在 explorer 里时，改参数不需要重装，直接写注册表 + 让任务栏重排。
+    // DLL 侧每 700ms 也会自己扫一次注册表，所以这里即使不发消息，最多 1 秒后也会生效。
+    if ((widthGiven || reservedGiven) && IsDllResident()) {
+        if (reserved < TEQW_MIN_RESERVED || reserved > TEQW_MAX_RESERVED) {
+            fwprintf(stderr, L"[x] 预留空白需在 %d-%d 之间\n", TEQW_MIN_RESERVED,
+                     TEQW_MAX_RESERVED);
+            return 1;
+        }
+        if (widthGiven) {
+            if (width < TEQW_MIN_WIDTH || width > TEQW_MAX_WIDTH) {
+                fwprintf(stderr, L"[x] 按钮宽度需在 %d-%d 之间\n", TEQW_MIN_WIDTH,
+                         TEQW_MAX_WIDTH);
+                return 1;
+            }
+            RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_WIDTH, width);
+        }
+        if (reservedGiven) {
+            RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_RESERVED, reserved);
+        }
+        NudgeTaskbarFromManager();
+        Sleep(400);
+        NudgeTaskbarFromManager();
+        if (!quiet) {
+            wprintf(L"[OK] 参数已更新并立即生效（未重装）：\n");
+            if (widthGiven) wprintf(L"     按钮宽度上限: %lu DIP\n", width);
+            if (reservedGiven) wprintf(L"     右侧预留空白: %lu DIP\n", reserved);
+            wprintf(L"     用 --status 可以看到实际生效值。\n");
+        }
+        return 0;
+    }
+
+    return DoInstall(width, reserved, autostart, quiet);
 }

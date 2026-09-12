@@ -27,7 +27,8 @@
 #define TEQW_REG_RUN_KEY       L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define TEQW_REG_RUN_VALUE     L"TaskbarEqWidth"     // 开机自启（可选，可关）
 #define TEQW_REG_CFG_KEY       L"Software\\TaskbarEqWidth"
-#define TEQW_REG_VAL_WIDTH     L"ItemWidth"          // 按钮宽度，DWORD
+#define TEQW_REG_VAL_WIDTH     L"ItemWidth"          // 按钮宽度上限，DWORD
+#define TEQW_REG_VAL_RESERVED  L"ReservedWidth"      // 任务栏右侧预留空白，DWORD
 #define TEQW_REG_VAL_MANAGED   L"Managed"            // 标记：由管理器安装（DWORD）
 
 // ---- 运行状态（共享内存，explorer 退出即自动消失，不落盘）-------------------
@@ -36,10 +37,14 @@
 struct TeqwStatus {
     DWORD magic;        // == TEQW_STATUS_MAGIC 才视为有效
     DWORD hookOk;       // 1 = 挂钩成功
-    DWORD itemWidth;    // 当前生效的按钮宽度
+    DWORD itemWidth;    // 当前实际生效的按钮宽度
     DWORD fromCache;    // 1 = 本次未联网，用的是缓存 PDB
     DWORD initDone;     // 1 = 初始化流程已走完（无论成功还是失败）
     DWORD downloadPct;  // PDB 下载进度 0..100；0xFFFFFFFF = 尚未开始下载
+    // ---- 布局几何（供 --status 显示，也用于诊断"留不出空白"这类问题）----
+    DWORD buttonCount;  // 观测到的任务栏按钮数
+    DWORD reserved;     // 当前生效的预留空白（DIP）
+    DWORD availWidth;   // 标定出的任务栏按钮区可用总宽（DIP），0 = 尚未标定
 };
 
 // ---- 默认参数 --------------------------------------------------------------
@@ -47,6 +52,11 @@ struct TeqwStatus {
 #define TEQW_DEFAULT_WIDTH     176
 #define TEQW_MIN_WIDTH         50
 #define TEQW_MAX_WIDTH         400
+// 任务栏最右侧要留出的空白（DIP）。留白是必须的：任务栏按钮铺满整条任务栏时，
+// 鼠标没有任何"空白处"可以右键，也就点不出「任务栏设置」。
+#define TEQW_DEFAULT_RESERVED  120
+#define TEQW_MIN_RESERVED      0
+#define TEQW_MAX_RESERVED      600
 
 // ---- 管理器命令行 ----------------------------------------------------------
 //   TaskbarEqWidth.exe                安装并立即生效（默认）

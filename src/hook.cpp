@@ -1,8 +1,10 @@
 // ============================================================================
 //  hook.cpp —— TaskbarEqWidthHook.dll  （x64）
 //
-//  这个 DLL 会被注入到 explorer.exe，做一件事：
-//      把任务栏每个按钮的宽度固定成同一个值 —— 也就是"等宽"。
+//  这个 DLL 会被注入到 explorer.exe，做两件事：
+//      1) 把任务栏每个按钮的宽度固定成同一个值 —— 也就是"等宽"；
+//      2) 在任务栏最右侧永远留出一段空白（默认 120 DIP），否则按钮铺满整条
+//         任务栏、鼠标无处可右键，也就点不出「任务栏设置」。
 //
 //  原理（照搬 Windhawk 那个模块的公开思路，但只保留等宽这一条）：
 //      Taskbar.View.dll 里 TaskListButton::UpdateButtonPadding 每次布局都会调用，
@@ -75,7 +77,30 @@ namespace Controls = winrt::Windows::UI::Xaml::Controls;
 static HINSTANCE                  g_hinst          = nullptr;
 static std::atomic<bool>          g_unloading{false};
 static std::atomic<int>           g_itemWidth{TEQW_DEFAULT_WIDTH};
+static std::atomic<int>           g_reserved{TEQW_DEFAULT_RESERVED};
 static DWORD                      g_statusFromCache = 0;
+
+// ---------------------------------------------------------------------------
+//  布局几何（只在 explorer 的 UI 线程上读写，因此不需要任何锁）
+//
+//  为什么需要它：把每个按钮都设成固定 176 DIP 时，若 "176 × 按钮数" 已经超过
+//  任务栏剩下的空间，系统会把它按可用宽度压回去 —— 结果按钮正好铺满整条任务栏，
+//  右侧一点空白都不剩，鼠标没有地方可以右键，也就点不出「任务栏设置」。
+//
+//  解决思路：先标定出"按钮区总可用宽度"，再让 每个按钮 = 可用宽度/按钮数 - 预留/按钮数，
+//  这样无论开多少个窗口，末尾始终空出约 `预留` 这么多 DIP。
+//
+//  标定只认一个证据：任务栏自己刚刚写进按钮的宽度。它要么等于我们刚写进去的值
+//  （说明系统没在压缩我们，读数无效），要么小于我们设的上限（说明系统在按可用空间
+//  压缩，这个值就是"可用宽度 / 按钮数"）。用这条规则就自然避开了自我反馈的死循环。
+// ---------------------------------------------------------------------------
+static double                     g_available      = 0.0;  // 按钮区可用总宽（DIP），0 = 未标定
+static double                     g_lastApplied    = -1.0; // 上一次写入的宽度
+static bool                       g_appliedOnce    = false;// 是否已经应用过一轮（之后读数才可信）
+static bool                       g_outerWritable  = true; // 是否还能由我们决定按钮外层宽度
+static std::atomic<unsigned>      g_pubWidth{0u};          // 供共享内存展示
+static std::atomic<unsigned>      g_pubAvail{0u};
+static std::atomic<unsigned>      g_pubCount{0u};
 
 static HANDLE                     g_evUnload       = nullptr;
 static HANDLE                     g_evUnloaded     = nullptr;
@@ -235,6 +260,72 @@ static bool ApplyWidthLabelGrid(FrameworkElement const& buttonElement,
 }
 
 // ---------------------------------------------------------------------------
+//  按钮计数
+//
+//  为什么要数按钮：预留的空白要按按钮数分摊成"每个按钮让出多少"，
+//  所以需要一个当前按钮数量。这里用最朴素的办法——观察钩子被调用的次数：
+//  任务栏每次重排都会对每个按钮调用一次 UpdateButtonPadding，
+//  于是"5 秒窗口内见过的不同按钮对象"就是按钮数。
+//
+//  只增不减：窗口过期的瞬间若只见到 1 个按钮，按 1 去分摊会让那一个按钮
+//  被压得极窄。所以这里取"本次会话见过的最大值"，宁可少留一点空白，
+//  也不让按钮宽度突然崩掉。
+// ---------------------------------------------------------------------------
+static void* g_seen[128];
+static int   g_seenN    = 0;
+static DWORD g_seenTick = 0;
+static int   g_countMax = 1;
+
+static int NoteButton(void* pThis) {
+    DWORD now = GetTickCount();
+    if (now - g_seenTick > 5000) g_seenN = 0;   // 一个"重排窗口"
+    g_seenTick = now;
+
+    for (int i = 0; i < g_seenN; ++i) {
+        if (g_seen[i] == pThis) {
+            if (g_countMax < g_seenN) g_countMax = g_seenN;
+            return g_countMax;
+        }
+    }
+    if (g_seenN < 128) g_seen[g_seenN++] = pThis;
+    if (g_countMax < g_seenN) g_countMax = g_seenN;
+    return g_countMax;
+}
+
+// ---------------------------------------------------------------------------
+//  标定"按钮区可用总宽"
+//
+//  规则见文件顶部注释：只接受"系统自己刚写进去、且与我们写入的值不同"的宽度。
+//  另外要求它明显小于我们设的上限（否则我们分辨不出这是系统的自适应结果，
+//  还是我们设的内容宽度被原样采纳了）。
+//  变化小于 8 DIP 时不重新标定，避免来回抖动导致按钮宽度不稳。
+// ---------------------------------------------------------------------------
+static void CalibrateAvailable(FrameworkElement const& btn, int count) {
+    if (!g_appliedOnce || count < 1) return;
+
+    double sysW = btn.Width();
+    if (!std::isfinite(sysW) || sysW < static_cast<double>(TEQW_MIN_WIDTH)) return;
+    if (std::fabs(sysW - g_lastApplied) < 0.5) return;          // 是我们自己写的
+    if (sysW >= static_cast<double>(g_itemWidth.load()) - 0.5) return;  // 没有压缩迹象
+
+    // 走到这里说明：外层宽度是系统自己写进去的，我们写不过它。
+    // 立刻放弃写外层——继续硬写会变成"每帧都在改"的无限重排。
+    // 好消息是不需要它：把内容宽度压到可用宽度以下，系统自然会留出空白。
+    if (g_outerWritable) {
+        g_outerWritable = false;
+        LogLine(L"[i] 外层宽度由系统掌控，改用只约束内容的方式（留白同样生效）");
+    }
+
+    double avail = sysW * count;
+    if (g_available <= 0.0 || std::fabs(avail - g_available) > 8.0) {
+        g_available = avail;
+        LogLine(L"[i] 标定：系统给每个按钮 %.1f DIP × %d 个 = 可用宽度 %.1f DIP",
+                sysW, count, avail);
+        g_pubAvail.store(static_cast<unsigned>(avail + 0.5));
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  核心：给一个任务栏按钮应用固定宽度
 // ---------------------------------------------------------------------------
 static void ApplyFixedWidthToButton(void* pThis) {
@@ -256,10 +347,34 @@ static void ApplyFixedWidthToButton(void* pThis) {
         return;
     }
 
-    // 目标值：卸载中则恢复成 NaN（= 交还系统按内容自动计算）
-    double want = g_unloading.load()
-                      ? std::numeric_limits<double>::quiet_NaN()
-                      : static_cast<double>(g_itemWidth.load());
+    // ---- 目标宽度 --------------------------------------------------------
+    // 卸载中 -> NaN（= 交还系统按内容自动计算）
+    // 正常 -> min(可用宽度, 上限宽度) - 预留/按钮数
+    //         前半段保证按钮铺得下且等宽，后半段保证末尾留出空白。
+    const bool unloading = g_unloading.load();
+    const int  count     = unloading ? 1 : NoteButton(pThis);
+    double     want;
+    if (unloading) {
+        want = std::numeric_limits<double>::quiet_NaN();
+    } else {
+        const double maxW = static_cast<double>(g_itemWidth.load());
+        CalibrateAvailable(buttonElement, count);
+
+        double perButton = (g_available > 0.0) ? (g_available / count) : maxW;
+        if (perButton > maxW) perButton = maxW;   // 按钮很少时不要超出上限
+
+        want = perButton - static_cast<double>(g_reserved.load()) / count;
+        if (want < TEQW_MIN_WIDTH) want = TEQW_MIN_WIDTH;
+        if (want > maxW) want = maxW;
+
+        g_pubCount.store(static_cast<unsigned>(count));
+        g_pubWidth.store(static_cast<unsigned>(want + 0.5));
+        if (g_logApplied.load() == 0) {
+            LogLine(L"[i] 宽度: 可用=%s 按钮数=%d 预留=%d -> 每个按钮 %.1f DIP",
+                    g_available > 0.0 ? L"已标定" : L"未标定(先用上限)",
+                    count, g_reserved.load(), want);
+        }
+    }
 
     // 先判断本机走哪条路径，并把结论写进日志（只写一次）。
     bool isLabelGrid = false;
@@ -280,11 +395,36 @@ static void ApplyFixedWidthToButton(void* pThis) {
                             : L"普通面板（旧式实现），直接设置 IconPanel.Width");
     }
 
-    bool changed = isLabelGrid ? ApplyWidthLabelGrid(buttonElement, grid, want)
-                               : ApplyWidthPlainPanel(iconPanel, want);
+    // 两层一起改才稳：
+    //   外层（按钮本体）—— 决定这个按钮最终占多宽，是"能不能留出空白"的关键。
+    //                      系统的自适应布局会往这里写值，我们钩子跑在它之后，所以写得住。
+    //   内层（IconPanel）—— 决定内容怎么排，避免标签把按钮撑开。
+    // 若发现外层其实是系统在写（见 CalibrateAvailable），就只做内层。
+    bool changed = false;
+    if (unloading) {
+        buttonElement.Width(std::numeric_limits<double>::quiet_NaN());
+    } else if (g_outerWritable) {
+        double curOuter = buttonElement.Width();
+        bool sameOuter = (curOuter == want) || (std::isnan(curOuter) && std::isnan(want));
+        if (!sameOuter) {
+            buttonElement.Width(want);
+            changed = true;
+        }
+    }
+
+    if (isLabelGrid ? ApplyWidthLabelGrid(buttonElement, grid, want)
+                    : ApplyWidthPlainPanel(iconPanel, want)) {
+        changed = true;
+    }
+
+    if (!unloading) {
+        g_lastApplied = want;   // 记住我们写的值，标定时用来区分"谁写的"
+        g_appliedOnce = true;
+    }
 
     if (changed && g_logApplied.fetch_add(1) < 1) {
-        LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP", want);
+        LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP（右侧留白约 %d DIP）",
+                want, g_reserved.load());
     }
 }
 
@@ -346,21 +486,52 @@ static HWND CreateMsgHostWindow() {
 }
 
 // ---------------------------------------------------------------------------
-//  读取配置（HKCU\Software\TaskbarEqWidth\ItemWidth）
+//  读取配置
+//      HKCU\Software\TaskbarEqWidth\ItemWidth      按钮宽度上限
+//      HKCU\Software\TaskbarEqWidth\ReservedWidth  右侧预留空白
+//  每次读都返回是否有变化，用于"改完立刻生效"（不必重装）。
 // ---------------------------------------------------------------------------
-static void LoadConfig() {
+static bool LoadConfig() {
+    bool changed = false;
     HKEY hKey = nullptr;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, TEQW_REG_CFG_KEY, 0, KEY_READ, &hKey) ==
         ERROR_SUCCESS) {
         DWORD value = 0, size = sizeof(value), type = 0;
+
+        size = sizeof(value);
         if (RegQueryValueExW(hKey, TEQW_REG_VAL_WIDTH, nullptr, &type,
                              reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS &&
             type == REG_DWORD && value >= TEQW_MIN_WIDTH && value <= TEQW_MAX_WIDTH) {
-            g_itemWidth.store(static_cast<int>(value));
+            if (g_itemWidth.load() != static_cast<int>(value)) {
+                g_itemWidth.store(static_cast<int>(value));
+                changed = true;
+            }
+        }
+
+        value = 0;
+        size  = sizeof(value);
+        if (RegQueryValueExW(hKey, TEQW_REG_VAL_RESERVED, nullptr, &type,
+                             reinterpret_cast<LPBYTE>(&value), &size) == ERROR_SUCCESS &&
+            type == REG_DWORD && value >= TEQW_MIN_RESERVED && value <= TEQW_MAX_RESERVED) {
+            if (g_reserved.load() != static_cast<int>(value)) {
+                g_reserved.store(static_cast<int>(value));
+                changed = true;
+            }
         }
         RegCloseKey(hKey);
     }
+    return changed;
 }
+
+// 让任务栏整体重排一次，钩子就会用新参数重新写一遍宽度。
+// 换分辨率、改配置后都需要这个，否则要等到用户下次点开某个窗口才会刷新。
+static void NudgeTaskbar() {
+    HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
+    if (!hTray) return;
+    DWORD_PTR unused = 0;
+    SendMessageTimeoutW(hTray, WM_SETTINGCHANGE, 0, 0, SMTO_NORMAL, 1000, &unused);
+}
+
 
 // ---------------------------------------------------------------------------
 //  等待 Taskbar.View.dll 被 explorer 载入
@@ -382,13 +553,9 @@ static void RestoreAndUnhook() {
     g_unloading.store(true);
 
     // 触发任务栏重新布局：我们的钩子会在这轮里把宽度改回原生值
-    HWND hTray = FindWindowW(L"Shell_TrayWnd", nullptr);
-    if (hTray) {
-        DWORD_PTR unused = 0;
-        SendMessageTimeoutW(hTray, WM_SETTINGCHANGE, 0, 0, SMTO_NORMAL, 1000, &unused);
-        Sleep(400);
-        SendMessageTimeoutW(hTray, WM_SETTINGCHANGE, 0, 0, SMTO_NORMAL, 1000, &unused);
-    }
+    NudgeTaskbar();
+    Sleep(400);
+    NudgeTaskbar();
 
     if (g_origUpdateButtonPadding) {
         MH_DisableHook(reinterpret_cast<LPVOID>(g_target));
@@ -413,7 +580,8 @@ static DWORD WINAPI InitThread(LPVOID) {
 
     CreateMsgHostWindow();
     LoadConfig();
-    LogLine(L"配置的按钮宽度: %d DIP", g_itemWidth.load());
+    LogLine(L"配置: 按钮宽度上限 %d DIP，右侧预留空白 %d DIP",
+            g_itemWidth.load(), g_reserved.load());
 
     g_evUnload = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_UNLOAD);
     g_evInitDone = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_INITDONE);
@@ -431,6 +599,9 @@ static DWORD WINAPI InitThread(LPVOID) {
             g_pStatus->fromCache = 0;
             g_pStatus->initDone = 0;
             g_pStatus->downloadPct = 0xFFFFFFFFu;  // 尚未开始下载
+            g_pStatus->buttonCount = 0;
+            g_pStatus->reserved = static_cast<DWORD>(g_reserved.load());
+            g_pStatus->availWidth = 0;
         }
     }
 
@@ -472,8 +643,8 @@ static DWORD WINAPI InitThread(LPVOID) {
                     LogLine(L"MH_EnableHook -> %d", static_cast<int>(e));
                     if (e == MH_OK) {
                         if (g_pStatus) g_pStatus->hookOk = 1;
-                        LogLine(L"[OK] 钩子已生效，任务栏按钮宽度将被固定为 %d",
-                                g_itemWidth.load());
+                        LogLine(L"[OK] 钩子已生效（宽度上限 %d DIP，右侧预留 %d DIP）",
+                                g_itemWidth.load(), g_reserved.load());
                     }
                 }
             }
@@ -513,8 +684,26 @@ static DWORD WINAPI InitThread(LPVOID) {
         FreeLibraryAndExitThread(reinterpret_cast<HMODULE>(g_hinst), 0);
     }
 
-    // ---- 常驻等待卸载指令 --------------------------------------------------
-    if (g_evUnload) WaitForSingleObject(g_evUnload, INFINITE);
+    // ---- 常驻：等卸载指令，同时盯着配置变化 --------------------------------
+    // 每 700ms 扫一次注册表。改动（宽度上限 / 预留空白）会立刻触发一次任务栏重排，
+    // 钩子随即用新参数重写宽度 —— 于是调参不需要重装、也不需要重启资源管理器。
+    for (;;) {
+        if (!g_evUnload) break;
+        if (WaitForSingleObject(g_evUnload, 700) == WAIT_OBJECT_0) break;
+
+        if (LoadConfig()) {
+            LogLine(L"[i] 配置已变更：宽度上限 %d DIP，预留 %d DIP —— 立即重排任务栏",
+                    g_itemWidth.load(), g_reserved.load());
+            if (g_pStatus) g_pStatus->reserved = static_cast<DWORD>(g_reserved.load());
+            NudgeTaskbar();
+        }
+        if (g_pStatus) {
+            unsigned w = g_pubWidth.load();
+            if (w > 0) g_pStatus->itemWidth = w;
+            g_pStatus->buttonCount = g_pubCount.load();
+            g_pStatus->availWidth  = g_pubAvail.load();
+        }
+    }
 
     LogLine(L"收到卸载指令，开始恢复...");
     RestoreAndUnhook();
