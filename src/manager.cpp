@@ -23,6 +23,7 @@
 #include <tlhelp32.h>
 
 #include <cstdio>
+#include <cstdlib>   // _wtoi
 #include <string>
 
 #include "shared.h"

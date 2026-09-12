@@ -1,12 +1,17 @@
 @echo off
 rem ===========================================================================
-rem  build.bat —— 一键编译 TaskbarEqWidth（x64）
+rem  build.bat - 一键编译 TaskbarEqWidth (x64)
 rem
 rem  依赖（需自行安装，均为免费工具）：
-rem    - Visual Studio 2022 生成工具（勾选"使用 C++ 的桌面开发"）
+rem    - Visual Studio 生成工具（勾选"使用 C++ 的桌面开发"）
 rem    - Windows SDK 10.0.22000 或更高（自带 C++/WinRT 头文件）
 rem  MinHook 源码已随包附带在 third_party\minhook，编译无需联网。
+rem
+rem  注意：本文件刻意不在括号块里放中文。cmd.exe 按非 UTF-8 代码页解析批处理时，
+rem        多字节汉字有可能吞掉紧跟其后的 & 或 )，导致命令被拆错、编译莫名失败。
+rem        所以错误处理统一用 goto，中文只出现在独立的 echo 行上。
 rem ===========================================================================
+chcp 65001 >nul 2>nul
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
@@ -38,31 +43,21 @@ if not defined VCVARS (
   )
 )
 
-if not defined VCVARS (
-  echo [x] 未找到 Visual Studio 2022 的 vcvars64.bat
-  echo     请安装 "Visual Studio 2022 生成工具" 并勾选 "使用 C++ 的桌面开发"
-  echo     下载: https://visualstudio.microsoft.com/zh-hans/downloads/
-  if not defined TEQW_NO_PAUSE pause
-  exit /b 1
-)
+if not defined VCVARS goto :err_novs
+
 echo     使用: %VCVARS%
 call "%VCVARS%" >nul
-if errorlevel 1 ( echo [x] 初始化编译环境失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_vcvars
 
 set "SDKROOT=%WindowsSdkDir%Include\%WindowsSDKLibVersion%cppwinrt"
-if not exist "%SDKROOT%\winrt\Windows.Foundation.h" (
-  echo [x] 未找到 C++/WinRT 头文件: %SDKROOT%
-  echo     请确认已安装 Windows SDK 10.0.22000 或更高版本
-  if not defined TEQW_NO_PAUSE pause
-  exit /b 1
-)
+if not exist "%SDKROOT%\winrt\Windows.Foundation.h" goto :err_nosdk
 
 if not exist bin mkdir bin
 if not exist obj mkdir obj
 if not exist obj\mh mkdir obj\mh
 
-rem 说明：MinHook 的 hook.c 会生成 hook.obj，与我们的 hook.cpp 同名，
-rem       所以两批目标文件分别输出到 obj\mh\ 和 obj\，避免互相覆盖。
+rem MinHook 的 hook.c 会生成 hook.obj，与我们的 hook.cpp 同名，
+rem 所以两批目标文件分开输出到 obj\mh\ 和 obj\，避免互相覆盖。
 set "CFLAGS=/nologo /O2 /MT /DNDEBUG /DWIN32 /D_WINDOWS /W3"
 set "CXXFLAGS=%CFLAGS% /std:c++17 /EHsc /DUNICODE /D_UNICODE"
 set "INC=/I"src" /I"third_party\minhook\include" /I"%SDKROOT%""
@@ -74,27 +69,27 @@ cl %CFLAGS% /c /Foobj\mh\ ^
    third_party\minhook\src\buffer.c ^
    third_party\minhook\src\trampoline.c ^
    third_party\minhook\src\hde\hde64.c
-if errorlevel 1 ( echo [x] MinHook 编译失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_mh
 
 echo.
 echo === [3/4] 编译注入 DLL（TaskbarEqWidthHook.dll）===
 cl %CXXFLAGS% %INC% /c /Foobj\ src\hook.cpp src\symbols.cpp
-if errorlevel 1 ( echo [x] DLL 编译失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_dllobj
 
 link /nologo /DLL /OUT:bin\TaskbarEqWidthHook.dll /MACHINE:X64 ^
    obj\hook.obj obj\symbols.obj ^
    obj\mh\hook.obj obj\mh\buffer.obj obj\mh\trampoline.obj obj\mh\hde64.obj ^
    windowsapp.lib runtimeobject.lib dbghelp.lib winhttp.lib psapi.lib ole32.lib oleaut32.lib
-if errorlevel 1 ( echo [x] DLL 链接失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_dlllink
 
 echo.
 echo === [4/4] 编译管理器 EXE（TaskbarEqWidth.exe）===
 cl %CXXFLAGS% %INC% /c /Foobj\ src\manager.cpp
-if errorlevel 1 ( echo [x] 管理器编译失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_exeobj
 
 link /nologo /OUT:bin\TaskbarEqWidth.exe /MACHINE:X64 /SUBSYSTEM:CONSOLE ^
    obj\manager.obj shell32.lib advapi32.lib
-if errorlevel 1 ( echo [x] 管理器链接失败 & if not defined TEQW_NO_PAUSE pause & exit /b 1 )
+if errorlevel 1 goto :err_exelink
 
 echo.
 echo ================================================
@@ -109,3 +104,45 @@ echo    3. TaskbarEqWidth.exe --status        查看状态
 echo    4. TaskbarEqWidth.exe --uninstall     完全卸载
 echo.
 if not defined TEQW_NO_PAUSE pause
+exit /b 0
+
+:err_novs
+echo [x] 未找到 Visual Studio 的 vcvars64.bat
+echo     请安装 "Visual Studio 2022 生成工具" 并勾选 "使用 C++ 的桌面开发"
+echo     下载: https://visualstudio.microsoft.com/zh-hans/downloads/
+goto :fail
+
+:err_vcvars
+echo [x] 初始化编译环境失败（vcvars64.bat 返回错误）
+goto :fail
+
+:err_nosdk
+echo [x] 未找到 C++/WinRT 头文件: %SDKROOT%
+echo     请确认已安装 Windows SDK 10.0.22000 或更高版本
+goto :fail
+
+:err_mh
+echo [x] MinHook 编译失败
+goto :fail
+
+:err_dllobj
+echo [x] 注入 DLL 编译失败
+goto :fail
+
+:err_dlllink
+echo [x] 注入 DLL 链接失败
+goto :fail
+
+:err_exeobj
+echo [x] 管理器编译失败
+goto :fail
+
+:err_exelink
+echo [x] 管理器链接失败
+goto :fail
+
+:fail
+echo.
+echo 编译未完成。
+if not defined TEQW_NO_PAUSE pause
+exit /b 1

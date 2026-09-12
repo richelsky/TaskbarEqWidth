@@ -1,22 +1,26 @@
 name: Build TaskbarEqWidth (x64)
 
-# 什么时候触发编译
+# 触发条件
 on:
   push:
     branches: [ main, master ]
-  workflow_dispatch:        # 也可以在网页上手动点按钮触发
+  workflow_dispatch:
 
 jobs:
   build:
-    # GitHub 免费的 Windows runner：已预装 VS2022 Enterprise(含 NativeDesktop 工作负载)
-    # 与 Windows SDK 10.0.22621 / 10.0.26100，所以本机无需任何编译环境
+    # GitHub 免费的 Windows runner：已预装 VS2022 Enterprise（含 NativeDesktop 工作负载）
+    # 与 Windows SDK 10.0.22621 / 10.0.26100，所以本机无需任何编译环境。
     runs-on: windows-latest
 
     steps:
       - name: 取出源码
         uses: actions/checkout@v4
 
-      - name: 打印编译环境（万一失败，这一步的日志能直接定位原因）
+      # 说明：所有 run 脚本一律只用 ASCII。
+      # 中文只出现在 YAML 的 name / comment 里（按 UTF-8 解析，安全）。
+      # 原因：runner 把 run 脚本写成 UTF-8 文件交给 shell，若脚本里混入中文，
+      #       某些 shell 按本地代码页解析时多字节字符会吞掉后面的 & 或 )。
+      - name: 打印编译环境（万一失败，这步日志可直接定位原因）
         shell: pwsh
         run: |
           Write-Host "---- Visual Studio ----"
@@ -26,22 +30,22 @@ jobs:
               -property installationPath
           Write-Host "---- Windows SDK ----"
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include" -Name -ErrorAction SilentlyContinue
-          Write-Host "---- C++/WinRT 头文件 ----"
+          Write-Host "---- C++/WinRT header ----"
           Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\Include\*\cppwinrt\winrt\Windows.Foundation.h" `
               -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
 
       - name: 编译
         shell: cmd
         env:
-          TEQW_NO_PAUSE: "1"     # 让 build.bat 不要在 CI 里等按键
+          TEQW_NO_PAUSE: "1"
         run: build.bat
 
       - name: 校验产物
         shell: cmd
         run: |
-          if not exist bin\TaskbarEqWidth.exe     ( echo [x] 缺少 TaskbarEqWidth.exe & exit /b 1 )
-          if not exist bin\TaskbarEqWidthHook.dll ( echo [x] 缺少 TaskbarEqWidthHook.dll & exit /b 1 )
-          echo 编译成功，产物如下：
+          if not exist bin\TaskbarEqWidth.exe     ( echo [x] missing TaskbarEqWidth.exe & exit /b 1 )
+          if not exist bin\TaskbarEqWidthHook.dll ( echo [x] missing TaskbarEqWidthHook.dll & exit /b 1 )
+          echo Build succeeded. Artifacts:
           dir /b bin
 
       - name: 上传成品
