@@ -31,7 +31,14 @@
 #include <unknwn.h>
 #undef GetCurrentTime  // windows.h 与 winrt 的宏冲突
 
+// 头文件顺序不能随便改：Windows.Foundation.Collections.h 必须在所有 Xaml 头文件
+// 之前。否则调用 IVector<T>::Size()/GetAt()/Append() 会报 C3779
+// （"a function that returns 'auto' cannot be used before it is defined"）——
+// 因为 consume_*IVector 的方法定义在 Collections.h 里，而 Xaml 头文件会在这里
+// 之前就把 IVector<ColumnDefinition> / IVector<UIElement> 实例化掉。
+// Windhawk 的 taskbar-labels 模块用的是同一个顺序。
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
 #include <winrt/Windows.UI.Xaml.Controls.h>
@@ -179,7 +186,7 @@ static bool ApplyWidthLabelGrid(FrameworkElement const& buttonElement,
     const bool unloading = std::isnan(want);   // 卸载时调用方传的就是 NaN
 
     auto cols = grid.ColumnDefinitions();
-    if (cols.Size() < 2) return false;
+    if (cols.Size() < 2u) return false;
 
     auto iconElement = FindChildByName(grid, L"Icon");
     if (!iconElement) return false;   // 结构不符，交给调用方记录
@@ -259,7 +266,7 @@ static void ApplyFixedWidthToButton(void* pThis) {
     Controls::Grid grid{nullptr};
     if (auto g = iconPanel.try_as<Controls::Grid>()) {
         try {
-            if (g.ColumnDefinitions().Size() >= 2) {
+            if (g.ColumnDefinitions().Size() >= 2u) {
                 isLabelGrid = true;
                 grid = g;
             }
