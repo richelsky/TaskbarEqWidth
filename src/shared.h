@@ -57,6 +57,13 @@ struct TeqwStatus {
 #define TEQW_DEFAULT_RESERVED  120
 #define TEQW_MIN_RESERVED      0
 #define TEQW_MAX_RESERVED      600
+// "延迟反推"可用宽度：写完按钮宽度后等这么久再读实际渲染值。
+// 必须大于 XAML 宽度动画的时长（实测几百毫秒），否则会把动画中间帧当成稳态值
+// —— 那正是 v0.2 死循环的成因。
+#define TEQW_PROBE_DELAY_MS    2000
+// 按钮数没确认之前不扣留白。DLL 刚注入时任务栏还没布局完，兜底的"数钩子调用"
+// 只能见到 1 个按钮，按 1 分摊会把第一个按钮压得极窄。
+#define TEQW_COUNT_SETTLE_MS   1500
 
 // ---- 管理器命令行 ----------------------------------------------------------
 //   TaskbarEqWidth.exe                安装并立即生效（默认）

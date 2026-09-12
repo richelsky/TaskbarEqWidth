@@ -478,13 +478,25 @@ static int DoInstall(DWORD width, DWORD reserved, bool autostart, bool quiet) {
     if (!quiet && lastPct >= 0) wprintf(L"\n");
 
     // 6) 读取 DLL 回报的状态
+    //
+    //    这里必须重新读几轮，不能直接沿用循环里带出来的 snap：
+    //    循环的退出条件是"InitDone 事件被置位"，而事件一置位我们是直接 break 的
+    //    —— 那一刻手上的 snap 还是**上一轮**读到的快照，停在 DLL 刚建好共享内存
+    //    时的初始值（hookOk=0 / initDone=0）。真机日志里"符号来源: 在线下载 +
+    //    状态通道未收到回报"就是这么来的：一次成功的安装被快照时序误判成失败。
     TeqwStatus finalSnap{};
     bool haveSnap = false;
-    if (sawStatus && snap.magic == TEQW_STATUS_MAGIC) {
-        finalSnap = snap;
-        haveSnap = true;
-    } else if (TryReadStatus(finalSnap) && finalSnap.magic == TEQW_STATUS_MAGIC) {
-        haveSnap = true;
+    for (int i = 0; i < 10; ++i) {
+        TeqwStatus cur{};
+        if (TryReadStatus(cur) && cur.magic == TEQW_STATUS_MAGIC) {
+            finalSnap = cur;
+            haveSnap = true;
+            if (cur.initDone && cur.hookOk) break;
+        } else if (sawStatus && snap.magic == TEQW_STATUS_MAGIC) {
+            finalSnap = snap;
+            haveSnap = true;
+        }
+        Sleep(150);
     }
 
     bool ok = false;
