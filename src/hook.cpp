@@ -484,6 +484,7 @@ static void ApplyFixedWidthToButton(void* pThis) {
     }
 
     double want;
+    double appliedReserve = 0.0;   // 这次实际扣掉的留白，供末尾那条日志用
     if (unloading) {
         want = std::numeric_limits<double>::quiet_NaN();
     } else {
@@ -500,6 +501,7 @@ static void ApplyFixedWidthToButton(void* pThis) {
                                    ? static_cast<double>(g_reserved.load())
                                    : 0.0;
         want = perButton - reserve / count;
+        appliedReserve = reserve;
         if (want < TEQW_MIN_WIDTH) want = TEQW_MIN_WIDTH;
         if (want > maxW) want = maxW;
 
@@ -572,9 +574,10 @@ static void ApplyFixedWidthToButton(void* pThis) {
         changed = true;
     }
 
-    if (changed && g_logApplied.fetch_add(1) < 1) {
-        LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP（右侧留白约 %d DIP）",
-                want, g_reserved.load());
+    // 加载中才打这条；卸载时 want 是 NaN，打出来只会干扰诊断。
+    if (!unloading && changed && g_logApplied.fetch_add(1) < 1) {
+        LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP（本次扣掉的右侧留白 %.0f DIP）",
+                want, appliedReserve);
     }
 }
 
