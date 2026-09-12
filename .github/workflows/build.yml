@@ -1,0 +1,71 @@
+name: Build TaskbarEqWidth (x64)
+
+# 什么时候触发编译
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:        # 也可以在网页上手动点按钮触发
+
+jobs:
+  build:
+    # GitHub 免费的 Windows runner：已预装 VS2022 Enterprise(NativeDesktop)
+    # 与 Windows SDK 10.0.22621 / 10.0.26100，所以本地无需任何编译环境
+    runs-on: windows-latest
+
+    steps:
+      - name: 取出源码
+        uses: actions/checkout@v4
+
+      - name: 打印编译环境（出问题时便于定位）
+        shell: cmd
+        run: |
+          echo ---- Visual Studio ----
+          "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          echo ---- Windows SDK ----
+          dir /b "C:\Program Files (x86)\Windows Kits\10\Include"
+          echo ---- C++/WinRT 头文件 ----
+          dir /b "C:\Program Files (x86)\Windows Kits\10\Include\*\cppwinrt\winrt\Windows.Foundation.h"
+
+      - name: 编译
+        shell: cmd
+        env:
+          TEQW_NO_PAUSE: "1"     # 让 build.bat 不要在 CI 里等按键
+        run: build.bat
+
+      - name: 校验产物
+        shell: cmd
+        run: |
+          if not exist bin\TaskbarEqWidth.exe      ( echo [x] 缺少 TaskbarEqWidth.exe & exit /b 1 )
+          if not exist bin\TaskbarEqWidthHook.dll  ( echo [x] 缺少 TaskbarEqWidthHook.dll & exit /b 1 )
+          echo 编译成功，产物如下：
+          dir /b bin
+
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: TaskbarEqWidth-x64
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            bin/TaskbarEqWidth.exe
+            bin/TaskbarEqWidthHook.dll
+
+      - name: 写结果摘要
+        shell: bash
+        run: |
+          {
+            echo "## 编译完成 ✅"
+            echo ""
+            echo "在本次运行页面底部的 **Artifacts** 区域下载 \`TaskbarEqWidth-x64.zip\`。"
+            echo ""
+            echo "解压后得到两个文件，放在同一个文件夹里："
+            echo ""
+            echo "| 文件 | 用途 |"
+            echo "|---|---|"
+            echo "| \`TaskbarEqWidth.exe\` | 管理器：安装 / 卸载 / 状态 |"
+            echo "| \`TaskbarEqWidthHook.dll\` | 注入到 explorer 的钩子（必须和 exe 放一起） |"
+            echo ""
+            echo "安装：**以管理员身份** 打开命令提示符，进入该文件夹，运行 \`TaskbarEqWidth.exe\`"
+            echo ""
+            echo "完全卸载：\`TaskbarEqWidth.exe --uninstall\`"
+          } >> "$GITHUB_STEP_SUMMARY"

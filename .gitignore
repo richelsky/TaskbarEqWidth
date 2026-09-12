@@ -1,0 +1,12 @@
+# 编译产物：由 GitHub Actions 生成，不进仓库
+bin/
+obj/
+
+# Visual Studio 临时文件
+*.user
+*.suo
+*.sdf
+.vs/
+
+# 符号缓存（运行时会生成在安装目录）
+symbols/
