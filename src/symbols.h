@@ -14,10 +14,21 @@
 
 namespace teqw {
 
-// 在 mod 模块内按通配符（如 L"*UpdateButtonPadding*"）查找第一个匹配的函数地址。
+// PDB 下载进度回调：pct 为 0..100，拿不到总长度时给 -1。
+using PdbProgressFn = void (*)(int pct, void* ctx);
+
+// 在 mod 模块内按通配符（如 L"*UpdateButtonPadding*"）查找函数地址。
+//
+// preferContaining 是必须的：同一个函数名在多个类里都存在（本机 PDB 里有 7 个
+//   UpdateButtonPadding），只靠通配符会随机命中不相干的类。传入类名关键字
+//   （如 L"TaskListButton"）来锁定唯一目标。
+//
 // cacheDir 用于存放下载的 PDB。返回 nullptr 表示未找到。
-// err（可选）会收到失败原因，便于写日志定位到底是哪一步断了。
-void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir,
-                    std::wstring* err = nullptr);
+// err（可选）会收到「选中了哪个符号」或失败原因，直接写进日志即可定位。
+// onPdbProgress（可选）用于把下载进度报给调用方——这个 PDB 有 47 MB，
+//   实测慢的时候要 10 分钟，没有进度提示用户会以为程序卡死了。
+void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferContaining,
+                    const std::wstring& cacheDir, std::wstring* err = nullptr,
+                    PdbProgressFn onPdbProgress = nullptr, void* progressCtx = nullptr);
 
 }  // namespace teqw

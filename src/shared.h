@@ -38,6 +38,8 @@ struct TeqwStatus {
     DWORD hookOk;       // 1 = 挂钩成功
     DWORD itemWidth;    // 当前生效的按钮宽度
     DWORD fromCache;    // 1 = 本次未联网，用的是缓存 PDB
+    DWORD initDone;     // 1 = 初始化流程已走完（无论成功还是失败）
+    DWORD downloadPct;  // PDB 下载进度 0..100；0xFFFFFFFF = 尚未开始下载
 };
 
 // ---- 默认参数 --------------------------------------------------------------

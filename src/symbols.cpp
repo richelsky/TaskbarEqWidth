@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 #include <wchar.h>
 
 #pragma comment(lib, "dbghelp.lib")
@@ -68,7 +69,7 @@ bool ReadPdbInfo(HMODULE mod, PdbInfo& out) {
 //  2. 极简 HTTPS 下载（WinHttp）
 // ---------------------------------------------------------------------------
 bool HttpDownload(const wchar_t* host, const std::wstring& urlPath,
-                  const std::wstring& outFile) {
+                  const std::wstring& outFile, PdbProgressFn onProgress, void* ctx) {
     bool ok = false;
     HINTERNET hSession = WinHttpOpen(L"TaskbarEqWidth/1.0",
                                      WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -93,12 +94,26 @@ bool HttpDownload(const wchar_t* host, const std::wstring& urlPath,
                                     WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
                                     WINHTTP_NO_HEADER_INDEX);
                 if (status == 200) {
+                    // 取总长度以便报进度（拿不到就给 -1）
+                    unsigned long long contentLen = 0;
+                    DWORD lenSz = sizeof(contentLen);
+                    if (WinHttpQueryHeaders(hRequest,
+                                            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
+                                            WINHTTP_HEADER_NAME_BY_INDEX, &contentLen, &lenSz,
+                                            WINHTTP_NO_HEADER_INDEX)) {
+                        // ok
+                    } else {
+                        contentLen = 0;
+                    }
+                    if (onProgress) onProgress(contentLen ? 0 : -1, ctx);
+
                     HANDLE hOut = CreateFileW(outFile.c_str(), GENERIC_WRITE, 0, nullptr,
                                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
                     if (hOut != INVALID_HANDLE_VALUE) {
                         DWORD total = 0;
                         BYTE buf[64 * 1024];
                         DWORD read = 0;
+                        int lastPct = -1;
                         ok = true;
                         while (WinHttpReadData(hRequest, buf, sizeof(buf), &read) && read > 0) {
                             DWORD written = 0;
@@ -107,6 +122,15 @@ bool HttpDownload(const wchar_t* host, const std::wstring& urlPath,
                                 break;
                             }
                             total += written;
+                            if (onProgress && contentLen) {
+                                int pct = static_cast<int>(
+                                    (static_cast<unsigned long long>(total) * 100) / contentLen);
+                                if (pct > 100) pct = 100;
+                                if (pct != lastPct) {
+                                    lastPct = pct;
+                                    onProgress(pct, ctx);
+                                }
+                            }
                         }
                         CloseHandle(hOut);
                         if (ok && total == 0) ok = false;  // 空文件视为失败
@@ -124,25 +148,25 @@ bool HttpDownload(const wchar_t* host, const std::wstring& urlPath,
 }
 
 // ---------------------------------------------------------------------------
-//  3. 符号枚举回调
+//  3. 符号枚举：先把所有匹配收集起来，再由调用方按类名筛选
+//
+//  为什么不能"取第一个匹配"：这个 PDB 里有 7 个不同的类各有一个同名的
+//  UpdateButtonPadding（TaskListButton / SearchBoxButton / OverflowToggleButton /
+//  AugmentedEntryPointButton / ExperienceToggleButton / SearchBoxLaunchListButton …），
+//  宽松通配符能把它们全匹配上，而枚举顺序没有任何保证。取第一个的后果是：
+//  钩子挂上了、日志显示成功，但任务栏毫无变化——最难排查的一类失败。
 // ---------------------------------------------------------------------------
-struct FindCtx {
-    void* found = nullptr;
+struct EnumCtx {
+    std::vector<std::wstring> names;
+    std::vector<void*> addrs;
 };
 
-// 显式用宽字符版本（PSYMBOL_INFOW / SymEnumSymbolsW / SymInitializeW）。
-// 用 PSYMBOL_INFO 这种 UNICODE 别名虽然通常也对，但别名映射是头文件的实现细节，
-// 依赖它一旦踩空就是一堆类型不匹配的报错。PDB 里的符号名是 ASCII，用宽字符比较无碍。
-BOOL CALLBACK EnumCallback(PSYMBOL_INFOW info, ULONG /*symbolSize*/, PVOID context) {
-    auto* ctx = reinterpret_cast<FindCtx*>(context);
-    const wchar_t* n = info->Name;
-    // 跳过编译器生成的胶水代码，只取真正的实现函数
-    if (wcsstr(n, L"dtor$") || wcsstr(n, L"thunk") || wcsstr(n, L"Adjustor") ||
-        wcsstr(n, L"vftable") || wcsstr(n, L"catch$")) {
-        return TRUE;
-    }
-    ctx->found = reinterpret_cast<void*>(info->Address);
-    return FALSE;  // 找到第一个即可收工
+BOOL CALLBACK EnumCollect(PSYMBOL_INFOW info, ULONG /*symbolSize*/, PVOID context) {
+    auto* c = static_cast<EnumCtx*>(context);
+    if (c->names.size() >= 64) return FALSE;  // 收集够了，收工
+    c->names.emplace_back(info->Name);
+    c->addrs.push_back(reinterpret_cast<void*>(info->Address));
+    return TRUE;
 }
 
 // SymInitialize 每进程只能有效调用一次
@@ -165,8 +189,9 @@ bool EnsureSymInitialized(const std::wstring& cacheDir) {
 // ---------------------------------------------------------------------------
 //  对外接口
 // ---------------------------------------------------------------------------
-void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& cacheDir,
-                    std::wstring* err) {
+void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferContaining,
+                    const std::wstring& cacheDir, std::wstring* err,
+                    PdbProgressFn onPdbProgress, void* progressCtx) {
     auto fail = [&](const wchar_t* why, const std::wstring& detail) -> void* {
         if (err) *err = std::wstring(why) + (detail.empty() ? L"" : L" | " + detail);
         return nullptr;
@@ -187,7 +212,7 @@ void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& ca
     bool fromCache = (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES);
     if (!fromCache) {
         std::wstring url = L"/download/symbols/" + pdb.name + L"/" + pdb.key + L"/" + pdb.name;
-        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath)) {
+        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath, onPdbProgress, progressCtx)) {
             return fail(L"PDB 下载失败（网络不通或符号服务器拒绝）", pdb.name);
         }
     }
@@ -229,15 +254,50 @@ void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const std::wstring& ca
         return fail(L"SymLoadModuleEx 失败（PDB 与模块不匹配或 PDB 损坏）", pdb.name);
     }
 
-    FindCtx ctx;
-    if (!SymEnumSymbolsW(GetCurrentProcess(), symBase, wildcard, EnumCallback, &ctx) || !ctx.found) {
-        if (err) {
-            *err = std::wstring(L"在 PDB 里没找到匹配的符号: ") + wildcard;
-            *err += fromCache ? L"（用的是本地缓存）" : L"（刚下载）";
-        }
-        return nullptr;
+    // 收集所有匹配，再按类名挑出我们要的那一个（见 EnumCtx 的注释）
+    EnumCtx c;
+    if (!SymEnumSymbolsW(GetCurrentProcess(), symBase, wildcard, EnumCollect, &c)) {
+        return fail(L"SymEnumSymbols 枚举失败", wildcard);
     }
-    return ctx.found;
+    if (c.names.empty()) {
+        return fail(L"PDB 里没有任何符号匹配这个通配符", wildcard);
+    }
+
+    // 1) 优先：既匹配通配符、又含有指定类名、还不是编译器生成的胶水符号
+    if (preferContaining) {
+        for (size_t i = 0; i < c.names.size(); ++i) {
+            const std::wstring& n = c.names[i];
+            if (n.find(preferContaining) == std::wstring::npos) continue;
+            if (n.find(L"dtor$") != std::wstring::npos) continue;
+            if (n.find(L"thunk") != std::wstring::npos) continue;
+            if (n.find(L"Adjustor") != std::wstring::npos) continue;
+            if (n.find(L"catch$") != std::wstring::npos) continue;
+            if (err) *err = L"选中符号: " + n;
+            return c.addrs[i];
+        }
+    }
+
+    // 2) 退一步：只要不是胶水符号就用（此时把全部候选写进 err，方便排查）
+    if (err) {
+        *err = L"没有含 \"" + std::wstring(preferContaining ? preferContaining : L"") +
+               L"\" 的候选，全部匹配为: ";
+        for (size_t i = 0; i < c.names.size() && i < 12; ++i) {
+            if (i) *err += L" | ";
+            *err += c.names[i];
+        }
+    }
+    for (size_t i = 0; i < c.names.size(); ++i) {
+        const std::wstring& n = c.names[i];
+        if (n.find(L"dtor$") != std::wstring::npos) continue;
+        if (n.find(L"thunk") != std::wstring::npos) continue;
+        if (n.find(L"Adjustor") != std::wstring::npos) continue;
+        if (n.find(L"catch$") != std::wstring::npos) continue;
+        if (err) *err += L"  [退化采用] " + n;
+        return c.addrs[i];
+    }
+
+    if (err) *err += L"  （全部都是胶水符号，放弃）";
+    return nullptr;
 }
 
 }  // namespace teqw

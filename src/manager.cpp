@@ -236,6 +236,22 @@ static bool IsDllResident() {
     return false;
 }
 
+// 读取 DLL 写在共享内存里的状态快照
+static bool TryReadStatus(TeqwStatus& out) {
+    HANDLE hMap = OpenFileMappingW(FILE_MAP_READ, FALSE, TEQW_SHM_STATUS);
+    if (!hMap) return false;
+    bool ok = false;
+    auto* st = static_cast<TeqwStatus*>(
+        MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, sizeof(TeqwStatus)));
+    if (st) {
+        out = *st;
+        ok = true;
+        UnmapViewOfFile(st);
+    }
+    CloseHandle(hMap);
+    return ok;
+}
+
 // 请求 DLL 卸载，返回是否确认卸载完成
 static bool RequestUnload(int timeoutMs) {
     if (!IsDllResident()) return true;
@@ -363,13 +379,46 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
         return 1;
     }
 
-    // 5) 等 DLL 完成初始化
+    // 5) 等 DLL 完成初始化。
+    //    这里刻意不用一个短超时：首次运行要从微软符号服务器下载 PDB，实测这个文件
+    //    有 47.6 MB，慢的时候要十几分钟。如果只等 35 秒就报"失败"，其实几分钟后它
+    //    就成功了——那是最容易误导人的一种结果。所以改成轮询 + 实时进度。
     HANDLE hInit = OpenEventW(SYNCHRONIZE, FALSE, TEQW_EV_INITDONE);
-    if (hInit) {
-        WaitForSingleObject(hInit, 35000);  // 首次需下载 PDB，给足时间
-        CloseHandle(hInit);
+    if (!quiet) wprintf(L"[*] 等待钩子就绪...\n");
+
+    bool initDone = false;
+    int lastPct = -1;
+    int lastShownSec = -1;
+    for (int sec = 0; sec < 1800; ++sec) {   // 上限 30 分钟
+        if (hInit && WaitForSingleObject(hInit, 1000) == WAIT_OBJECT_0) {
+            initDone = true;
+            break;
+        }
+        // 事件没等到也不要紧：DLL 会把进度写进共享内存，initDone 置 1 即表示跑完了
+        TeqwStatus snap{};
+        if (TryReadStatus(snap) && snap.magic == TEQW_STATUS_MAGIC) {
+            if (snap.initDone) {
+                initDone = true;
+                break;
+            }
+            if (!quiet && snap.downloadPct <= 100) {
+                int pct = static_cast<int>(snap.downloadPct);
+                if (pct != lastPct) {
+                    wprintf(L"\r[*] 正在下载符号文件 PDB: %3d%%    ", pct);
+                    lastPct = pct;
+                }
+            } else if (!quiet && sec >= 5 && sec - lastShownSec >= 10) {
+                wprintf(L"\r[*] 已等待 %d 秒（正在定位符号）...    ", sec);
+                lastShownSec = sec;
+            }
+        }
     }
-    Sleep(300);
+    if (hInit) CloseHandle(hInit);
+    if (!quiet && (lastPct >= 0 || lastShownSec >= 0)) wprintf(L"\n");
+    if (!initDone && !quiet) {
+        wprintf(L"[!] 等待超时，DLL 仍未报告初始化完成。下面照常读取它留下的状态。\n");
+    }
+    Sleep(200);
 
     // 6) 读取 DLL 回报的状态
     bool ok = false;

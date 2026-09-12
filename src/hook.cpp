@@ -132,6 +132,10 @@ static FrameworkElement FindChildByName(DependencyObject const& root,
     return nullptr;
 }
 
+// 只在头几次写日志，避免热路径把 hook.log 刷爆
+static std::atomic<int> g_logMissingPanel{0};
+static std::atomic<int> g_logApplied{0};
+
 // ---------------------------------------------------------------------------
 //  核心：给一个任务栏按钮应用固定宽度
 // ---------------------------------------------------------------------------
@@ -145,7 +149,14 @@ static void ApplyFixedWidthToButton(void* pThis) {
     if (!buttonElement) return;
 
     auto iconPanel = FindChildByName(buttonElement, L"IconPanel");
-    if (!iconPanel) return;
+    if (!iconPanel) {
+        // 找到了函数、也挂上了钩子，但按钮里没有叫 IconPanel 的元素，
+        // 就会表现成"日志说成功、任务栏毫无变化"。这种情况必须留下痕迹。
+        if (g_logMissingPanel.fetch_add(1) < 3) {
+            LogLine(L"[!] 按钮里没有名为 IconPanel 的子元素——界面结构可能变了，等宽不会生效");
+        }
+        return;
+    }
 
     // 目标值：卸载中则恢复成 NaN（= 交还系统按内容自动计算）
     double want = g_unloading.load()
@@ -159,6 +170,9 @@ static void ApplyFixedWidthToButton(void* pThis) {
                 (std::isnan(cur) && std::isnan(want));
     if (!same) {
         iconPanel.Width(want);
+        if (g_logApplied.fetch_add(1) < 1) {
+            LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP", want);
+        }
     }
 }
 
@@ -270,6 +284,12 @@ static void RestoreAndUnhook() {
     MH_Uninitialize();
 }
 
+// PDB 下载进度 -> 共享内存，供管理器的等待界面显示
+static void OnPdbProgress(int pct, void* ctx) {
+    auto* st = static_cast<TeqwStatus*>(ctx);
+    if (st) st->downloadPct = (pct < 0) ? 0xFFFFFFFFu : static_cast<DWORD>(pct);
+}
+
 // ---------------------------------------------------------------------------
 //  初始化线程（不能占用 loader lock，所以放在独立线程里做）
 // ---------------------------------------------------------------------------
@@ -297,6 +317,8 @@ static DWORD WINAPI InitThread(LPVOID) {
             g_pStatus->hookOk = 0;
             g_pStatus->itemWidth = static_cast<DWORD>(g_itemWidth.load());
             g_pStatus->fromCache = 0;
+            g_pStatus->initDone = 0;
+            g_pStatus->downloadPct = 0xFFFFFFFFu;  // 尚未开始下载
         }
     }
 
@@ -318,7 +340,10 @@ static DWORD WINAPI InitThread(LPVOID) {
         LogLine(L"PDB 缓存: %s", cached ? L"已有，直接使用" : L"没有，需要联网下载");
 
         std::wstring err;
-        g_target = teqw::ResolveSymbol(taskbarView, L"*UpdateButtonPadding*", cacheDir, &err);
+        g_target = teqw::ResolveSymbol(taskbarView, L"*UpdateButtonPadding*",
+                                       L"TaskListButton", cacheDir, &err,
+                                       OnPdbProgress, g_pStatus);
+        LogLine(L"符号定位: %s", err.empty() ? L"(无说明)" : err.c_str());
         if (!g_target) {
             LogLine(L"[x] 符号定位失败: %s", err.c_str());
             LogLine(L"    这个私有函数名可能在本机 Windows 版本上变了。");
@@ -345,7 +370,11 @@ static DWORD WINAPI InitThread(LPVOID) {
         }
     }
 
-    if (g_pStatus) g_pStatus->fromCache = g_statusFromCache;
+    if (g_pStatus) {
+        g_pStatus->fromCache = g_statusFromCache;
+        if (g_pStatus->downloadPct == 0xFFFFFFFFu) g_pStatus->downloadPct = 100;
+        g_pStatus->initDone = 1;  // 告诉管理器：初始化流程跑完了，不用再等
+    }
     LogLine(L"--- 初始化结束 (hookOk=%lu) ---",
             g_pStatus ? g_pStatus->hookOk : 0UL);
     if (g_evInitDone) SetEvent(g_evInitDone);
