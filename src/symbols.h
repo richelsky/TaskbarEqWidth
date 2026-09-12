@@ -27,8 +27,12 @@ using PdbProgressFn = void (*)(int pct, void* ctx);
 // err（可选）会收到「选中了哪个符号」或失败原因，直接写进日志即可定位。
 // onPdbProgress（可选）用于把下载进度报给调用方——这个 PDB 有 47 MB，
 //   实测慢的时候要 10 分钟，没有进度提示用户会以为程序卡死了。
+// outFromCache（可选）收到 PDB 是走本地缓存还是本次联网下载的。
+//   之所以由本函数回报而不是调用方自己猜：PDB 文件名是从 PE 调试目录里读出来的，
+//   调用方在此之前并不知道它叫什么，靠硬编码文件名去判断会得出错误结论。
 void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferContaining,
                     const std::wstring& cacheDir, std::wstring* err = nullptr,
-                    PdbProgressFn onPdbProgress = nullptr, void* progressCtx = nullptr);
+                    PdbProgressFn onPdbProgress = nullptr, void* progressCtx = nullptr,
+                    bool* outFromCache = nullptr);
 
 }  // namespace teqw

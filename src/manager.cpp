@@ -331,6 +331,17 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
     std::wstring targetDll = installDir + L"\\" + TEQW_HOOK_DLL_NAME;
     std::wstring sourceDll = selfDir + L"\\" + TEQW_HOOK_DLL_NAME;
 
+    // 0) 若上一份还挂在 explorer 里，先把它请出去，再动文件。
+    //    顺序很重要：DLL 还被 explorer 加载着时覆盖它可能失败（共享冲突），
+    //    结果是"更新"静默地变成了"还是旧代码"，而没有任何提示。
+    if (IsDllResident()) {
+        if (!quiet) wprintf(L"[*] 检测到正在运行，先卸载旧实例...\n");
+        if (!RequestUnload(5000)) {
+            if (!quiet) wprintf(L"[*] 卸载确认超时，改为重启资源管理器...\n");
+            RestartExplorer();
+        }
+    }
+
     // 1) 把 exe / dll 放到专属目录（若已在专属目录则跳过复制）
     if (_wcsicmp(selfPath.c_str(), targetExe.c_str()) != 0) {
         if (!CopyFileW(selfPath.c_str(), targetExe.c_str(), FALSE)) {
@@ -356,16 +367,7 @@ static int DoInstall(DWORD width, bool autostart, bool quiet) {
     RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_WIDTH, width);
     RegSetDword(TEQW_REG_CFG_KEY, TEQW_REG_VAL_MANAGED, 1);
 
-    // 3) 若已在运行，先卸载旧的一份，保证重新注入的是最新代码
-    if (IsDllResident()) {
-        if (!quiet) wprintf(L"[*] 检测到正在运行，先卸载旧实例...\n");
-        if (!RequestUnload(5000)) {
-            if (!quiet) wprintf(L"[*] 卸载确认超时，改为重启资源管理器...\n");
-            RestartExplorer();
-        }
-    }
-
-    // 4) 注入
+    // 3) 注入
     EnableDebugPrivilege();
     DWORD pid = FindExplorerPid();
     if (!pid) {

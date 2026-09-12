@@ -334,15 +334,13 @@ static DWORD WINAPI InitThread(LPVOID) {
                 reinterpret_cast<void*>(taskbarView), modPath);
 
         std::wstring cacheDir = g_selfDir + L"\\symbols";
-        std::wstring pdbPath = cacheDir + L"\\Taskbar.View.pdb";
-        bool cached = (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES);
-        g_statusFromCache = cached ? 1 : 0;
-        LogLine(L"PDB 缓存: %s", cached ? L"已有，直接使用" : L"没有，需要联网下载");
-
+        bool fromCache = false;
         std::wstring err;
         g_target = teqw::ResolveSymbol(taskbarView, L"*UpdateButtonPadding*",
                                        L"TaskListButton", cacheDir, &err,
-                                       OnPdbProgress, g_pStatus);
+                                       OnPdbProgress, g_pStatus, &fromCache);
+        g_statusFromCache = fromCache ? 1 : 0;
+        LogLine(L"PDB 缓存: %s", fromCache ? L"已有，直接使用" : L"没有，本次联网下载");
         LogLine(L"符号定位: %s", err.empty() ? L"(无说明)" : err.c_str());
         if (!g_target) {
             LogLine(L"[x] 符号定位失败: %s", err.c_str());
@@ -378,6 +376,30 @@ static DWORD WINAPI InitThread(LPVOID) {
     LogLine(L"--- 初始化结束 (hookOk=%lu) ---",
             g_pStatus ? g_pStatus->hookOk : 0UL);
     if (g_evInitDone) SetEvent(g_evInitDone);
+
+    // ---- 没挂上钩子就主动撤离，不留"已注入但没生效"的僵尸状态 -----------------
+    // 那种僵尸状态有两个坏处：一是 --status 显示「DLL 驻留：是 / 钩子：未挂上」，
+    // 看着像半成功，实际毫无作用；二是 explorer 会一直握着这个 DLL 文件，
+    // 妨碍下次覆盖更新。撤离后，管理器的下一次运行就是一次干净的重新尝试。
+    if (!g_pStatus || g_pStatus->hookOk != 1) {
+        LogLine(L"[!] 钩子未生效，DLL 将自行撤离 explorer（本次未成功，已回滚干净）");
+        // 给管理器留出读取状态的时间：它每秒轮询一次共享内存，这里等够几个周期再撤。
+        for (int i = 0; i < 10; ++i) {
+            if (g_evUnload && WaitForSingleObject(g_evUnload, 1000) == WAIT_OBJECT_0) break;
+        }
+        g_evUnloaded = CreateEventW(nullptr, TRUE, FALSE, TEQW_EV_UNLOADED);
+        if (g_evUnloaded) {
+            SetEvent(g_evUnloaded);
+            Sleep(30);
+            CloseHandle(g_evUnloaded);
+        }
+        if (g_pStatus) UnmapViewOfFile(g_pStatus);
+        if (g_hMapStatus) CloseHandle(g_hMapStatus);
+        if (g_evUnload) CloseHandle(g_evUnload);
+        if (g_evInitDone) CloseHandle(g_evInitDone);
+        LogLine(L"=== 已从 explorer.exe 撤离，任务栏保持原样 ===");
+        FreeLibraryAndExitThread(reinterpret_cast<HMODULE>(g_hinst), 0);
+    }
 
     // ---- 常驻等待卸载指令 --------------------------------------------------
     if (g_evUnload) WaitForSingleObject(g_evUnload, INFINITE);

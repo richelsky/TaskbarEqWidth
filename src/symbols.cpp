@@ -51,7 +51,18 @@ bool ReadPdbInfo(HMODULE mod, PdbInfo& out) {
         memcpy(&guid, cv + 4, sizeof(GUID));
         DWORD age;
         memcpy(&age, cv + 20, sizeof(DWORD));
-        out.name.assign(reinterpret_cast<const wchar_t*>(cv + 24));
+
+        // RSDS 里的 PDB 文件名是 **ASCII/UTF-8 窄字符串**（以 NUL 结尾），不是宽字符串。
+        // 这里曾经写成 reinterpret_cast<const wchar_t*>(cv + 24)，直接按 UTF-16 读，
+        // 结果是把 "Taskbar.View.pdb" 两两字节拼成了「慔歳慢⹲楖睥瀮扤」这种乱码。
+        // 那个乱码随后被拼进下载 URL，请求打到符号服务器上立刻被拒（实测 0.44 秒就失败），
+        // 而日志里只写「网络不通」—— 一个纯粹的编码错误被伪装成了网络问题。
+        const char* narrowName = reinterpret_cast<const char*>(cv + 24);
+        size_t narrowLen = 0;
+        while (narrowLen < 260 && narrowName[narrowLen] != '\0') ++narrowLen;  // 字段上限 260
+        if (narrowLen == 0) continue;
+        std::string narrowStr(narrowName, narrowLen);
+        out.name.assign(narrowStr.begin(), narrowStr.end());  // 逐字符窄转宽，ASCII 无损
 
         wchar_t key[64];
         swprintf_s(key, L"%08X%04X%04X%02X%02X%02X%02X%02X%02X%02X%02X%X",
@@ -67,84 +78,147 @@ bool ReadPdbInfo(HMODULE mod, PdbInfo& out) {
 
 // ---------------------------------------------------------------------------
 //  2. 极简 HTTPS 下载（WinHttp）
+//
+//  为什么要试三种代理模式：国内机器上常见的情况是系统里配了代理但代理不通，
+//  或者反过来只有直连才通。只固定用一种模式的话，失败时给出的信息是
+//  「网络不通」——用户根本无从下手。三种依次试，并把最后一次的真实错误码带回去。
 // ---------------------------------------------------------------------------
+const wchar_t* ProxyModeName(DWORD mode) {
+    switch (mode) {
+        case WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY: return L"自动代理";
+        case WINHTTP_ACCESS_TYPE_DEFAULT_PROXY:   return L"默认代理";
+        case WINHTTP_ACCESS_TYPE_NO_PROXY:        return L"直连";
+        default:                                  return L"未知";
+    }
+}
+
 bool HttpDownload(const wchar_t* host, const std::wstring& urlPath,
-                  const std::wstring& outFile, PdbProgressFn onProgress, void* ctx) {
-    bool ok = false;
-    HINTERNET hSession = WinHttpOpen(L"TaskbarEqWidth/1.0",
-                                     WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
-    if (!hSession) return false;
+                  const std::wstring& outFile, PdbProgressFn onProgress, void* ctx,
+                  std::wstring* diag) {
+    const DWORD modes[] = {
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,  // 读系统代理设置（Win8.1+）
+        WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,    // 同一件事的旧写法，兼容老系统
+        WINHTTP_ACCESS_TYPE_NO_PROXY,         // 完全直连
+    };
 
-    WinHttpSetTimeouts(hSession, 10000, 10000, 20000, 60000);
+    DWORD lastErr = 0;      // 最后一次 WinHTTP 层错误码
+    DWORD lastStatus = 0;   // 最后一次服务器返回的 HTTP 状态码
 
-    HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
-    if (hConnect) {
-        HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath.c_str(), nullptr,
-                                                WINHTTP_NO_REFERER,
-                                                WINHTTP_DEFAULT_ACCEPT_TYPES,
-                                                WINHTTP_FLAG_SECURE);
-        if (hRequest) {
-            if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
-                                   WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
-                WinHttpReceiveResponse(hRequest, nullptr)) {
-                DWORD status = 0, sz = sizeof(status);
-                WinHttpQueryHeaders(hRequest,
-                                    WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-                                    WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
-                                    WINHTTP_NO_HEADER_INDEX);
-                if (status == 200) {
-                    // 取总长度以便报进度（拿不到就给 -1）
-                    unsigned long long contentLen = 0;
-                    DWORD lenSz = sizeof(contentLen);
-                    if (WinHttpQueryHeaders(hRequest,
-                                            WINHTTP_QUERY_CONTENT_LENGTH | WINHTTP_QUERY_FLAG_NUMBER64,
-                                            WINHTTP_HEADER_NAME_BY_INDEX, &contentLen, &lenSz,
-                                            WINHTTP_NO_HEADER_INDEX)) {
-                        // ok
-                    } else {
-                        contentLen = 0;
-                    }
-                    if (onProgress) onProgress(contentLen ? 0 : -1, ctx);
+    for (DWORD mode : modes) {
+        bool ok = false;
+        DWORD status = 0;
+        lastErr = 0;
 
-                    HANDLE hOut = CreateFileW(outFile.c_str(), GENERIC_WRITE, 0, nullptr,
-                                              CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-                    if (hOut != INVALID_HANDLE_VALUE) {
-                        DWORD total = 0;
-                        BYTE buf[64 * 1024];
-                        DWORD read = 0;
-                        int lastPct = -1;
-                        ok = true;
-                        while (WinHttpReadData(hRequest, buf, sizeof(buf), &read) && read > 0) {
-                            DWORD written = 0;
-                            if (!WriteFile(hOut, buf, read, &written, nullptr) || written != read) {
-                                ok = false;
-                                break;
-                            }
-                            total += written;
-                            if (onProgress && contentLen) {
-                                int pct = static_cast<int>(
-                                    (static_cast<unsigned long long>(total) * 100) / contentLen);
-                                if (pct > 100) pct = 100;
-                                if (pct != lastPct) {
-                                    lastPct = pct;
-                                    onProgress(pct, ctx);
+        HINTERNET hSession = WinHttpOpen(L"TaskbarEqWidth/1.0", mode,
+                                         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) {
+            lastErr = GetLastError();
+            continue;
+        }
+        // 解析/连接各 15 秒，发送 30 秒；接收给 120 秒——这个 PDB 有 47 MB，
+        // 慢速网络下单次读取也可能停顿较久，超时给太紧会把正常的慢下载掐断。
+        WinHttpSetTimeouts(hSession, 15000, 15000, 30000, 120000);
+
+        HINTERNET hConnect = WinHttpConnect(hSession, host, INTERNET_DEFAULT_HTTPS_PORT, 0);
+        if (!hConnect) {
+            lastErr = GetLastError();
+        } else {
+            HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"GET", urlPath.c_str(), nullptr,
+                                                    WINHTTP_NO_REFERER,
+                                                    WINHTTP_DEFAULT_ACCEPT_TYPES,
+                                                    WINHTTP_FLAG_SECURE);
+            if (!hRequest) {
+                lastErr = GetLastError();
+            } else {
+                if (!WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                                        WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+                    lastErr = GetLastError();
+                } else if (!WinHttpReceiveResponse(hRequest, nullptr)) {
+                    lastErr = GetLastError();
+                } else {
+                    DWORD sz = sizeof(status);
+                    WinHttpQueryHeaders(hRequest,
+                                        WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                        WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz,
+                                        WINHTTP_NO_HEADER_INDEX);
+                    if (status == 200) {
+                        // 取总长度以便报进度（拿不到就给 -1）
+                        unsigned long long contentLen = 0;
+                        DWORD lenSz = sizeof(contentLen);
+                        if (!WinHttpQueryHeaders(hRequest,
+                                                 WINHTTP_QUERY_CONTENT_LENGTH |
+                                                     WINHTTP_QUERY_FLAG_NUMBER64,
+                                                 WINHTTP_HEADER_NAME_BY_INDEX, &contentLen,
+                                                 &lenSz, WINHTTP_NO_HEADER_INDEX)) {
+                            contentLen = 0;
+                        }
+                        if (onProgress) onProgress(contentLen ? 0 : -1, ctx);
+
+                        HANDLE hOut = CreateFileW(outFile.c_str(), GENERIC_WRITE, 0, nullptr,
+                                                  CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+                        if (hOut == INVALID_HANDLE_VALUE) {
+                            lastErr = GetLastError();
+                        } else {
+                            DWORD total = 0;
+                            BYTE buf[64 * 1024];
+                            DWORD read = 0;
+                            int lastPct = -1;
+                            ok = true;
+                            while (WinHttpReadData(hRequest, buf, sizeof(buf), &read) && read > 0) {
+                                DWORD written = 0;
+                                if (!WriteFile(hOut, buf, read, &written, nullptr) ||
+                                    written != read) {
+                                    lastErr = GetLastError();
+                                    ok = false;
+                                    break;
+                                }
+                                total += written;
+                                if (onProgress && contentLen) {
+                                    int pct = static_cast<int>(
+                                        (static_cast<unsigned long long>(total) * 100) / contentLen);
+                                    if (pct > 100) pct = 100;
+                                    if (pct != lastPct) {
+                                        lastPct = pct;
+                                        onProgress(pct, ctx);
+                                    }
                                 }
                             }
+                            if (ok && total == 0) {
+                                lastErr = ERROR_HANDLE_EOF;
+                                ok = false;   // 空文件视为失败
+                            }
+                            CloseHandle(hOut);
                         }
-                        CloseHandle(hOut);
-                        if (ok && total == 0) ok = false;  // 空文件视为失败
+                    } else {
+                        lastStatus = status;
                     }
                 }
+                WinHttpCloseHandle(hRequest);
             }
-            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
         }
-        WinHttpCloseHandle(hConnect);
-    }
-    WinHttpCloseHandle(hSession);
+        WinHttpCloseHandle(hSession);
 
-    if (!ok) DeleteFileW(outFile.c_str());
-    return ok;
+        if (ok) {
+            if (diag) *diag = std::wstring(L"下载成功（") + ProxyModeName(mode) + L"）";
+            return true;
+        }
+        DeleteFileW(outFile.c_str());
+
+        // 服务器已经给了 HTTP 应答，说明链路是通的，换代理模式没有意义
+        if (lastStatus) break;
+    }
+
+    if (diag) {
+        wchar_t buf[256];
+        if (lastStatus) {
+            swprintf_s(buf, L"三种代理模式均被拒，最后一次服务器返回 HTTP %lu", lastStatus);
+        } else {
+            swprintf_s(buf, L"三种代理模式均连不上，最后一次 WinHTTP 错误码 %lu", lastErr);
+        }
+        *diag = buf;
+    }
+    return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -191,11 +265,12 @@ bool EnsureSymInitialized(const std::wstring& cacheDir) {
 // ---------------------------------------------------------------------------
 void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferContaining,
                     const std::wstring& cacheDir, std::wstring* err,
-                    PdbProgressFn onPdbProgress, void* progressCtx) {
+                    PdbProgressFn onPdbProgress, void* progressCtx, bool* outFromCache) {
     auto fail = [&](const wchar_t* why, const std::wstring& detail) -> void* {
         if (err) *err = std::wstring(why) + (detail.empty() ? L"" : L" | " + detail);
         return nullptr;
     };
+    if (err) err->clear();
     if (!mod || !wildcard) return fail(L"参数无效", L"");
     if (cacheDir.empty()) return fail(L"缓存目录为空", L"");
 
@@ -210,11 +285,15 @@ void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferC
     // 2) 该 PDB 若未缓存就先下载（这个 DLL 的 PDB 有数十 MB，首次会慢）
     std::wstring pdbPath = cacheDir + L"\\" + pdb.name;
     bool fromCache = (GetFileAttributesW(pdbPath.c_str()) != INVALID_FILE_ATTRIBUTES);
+    if (outFromCache) *outFromCache = fromCache;
     if (!fromCache) {
         std::wstring url = L"/download/symbols/" + pdb.name + L"/" + pdb.key + L"/" + pdb.name;
-        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath, onPdbProgress, progressCtx)) {
-            return fail(L"PDB 下载失败（网络不通或符号服务器拒绝）", pdb.name);
+        std::wstring dlDiag;
+        if (!HttpDownload(L"msdl.microsoft.com", url, pdbPath, onPdbProgress, progressCtx,
+                          &dlDiag)) {
+            return fail(L"PDB 下载失败", pdb.name + L"  [" + dlDiag + L"]");
         }
+        if (err) *err = L"已下载符号文件: " + pdb.name;
     }
 
     if (!EnsureSymInitialized(cacheDir)) {
@@ -272,15 +351,16 @@ void* ResolveSymbol(HMODULE mod, const wchar_t* wildcard, const wchar_t* preferC
             if (n.find(L"thunk") != std::wstring::npos) continue;
             if (n.find(L"Adjustor") != std::wstring::npos) continue;
             if (n.find(L"catch$") != std::wstring::npos) continue;
-            if (err) *err = L"选中符号: " + n;
+            if (err) *err += (err->empty() ? L"" : L"  |  ") + std::wstring(L"选中符号: ") + n;
             return c.addrs[i];
         }
     }
 
     // 2) 退一步：只要不是胶水符号就用（此时把全部候选写进 err，方便排查）
     if (err) {
-        *err = L"没有含 \"" + std::wstring(preferContaining ? preferContaining : L"") +
-               L"\" 的候选，全部匹配为: ";
+        *err += (err->empty() ? L"" : L"  |  ");
+        *err += L"没有含 \"" + std::wstring(preferContaining ? preferContaining : L"") +
+                L"\" 的候选，全部匹配为: ";
         for (size_t i = 0; i < c.names.size() && i < 12; ++i) {
             if (i) *err += L" | ";
             *err += c.names[i];
