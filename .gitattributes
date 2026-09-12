@@ -1,0 +1,21 @@
+# 换行符策略
+#
+# 关键：*.bat / *.cmd 必须用 CRLF。cmd.exe 解析 LF-only 的批处理文件时会出错
+# （尤其是带括号块和标签的脚本），GitHub runner 检出时如果变成 LF，编译会莫名其妙失败。
+# 这里显式钉死，不依赖各机器的 core.autocrlf 设置。
+
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+
+*.c    text eol=lf
+*.h    text eol=lf
+*.cpp  text eol=lf
+*.yml  text eol=lf
+*.md   text eol=lf
+
+# 二进制/编译产物不要做换行转换
+*.exe  binary
+*.dll  binary
+*.pdb  binary
+*.lib  binary
+*.obj  binary
