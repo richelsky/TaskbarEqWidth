@@ -40,6 +40,13 @@ jobs:
           TEQW_NO_PAUSE: "1"
         run: build.bat
 
+      - name: 附上双击启动器
+        shell: cmd
+        run: |
+          copy /y run.bat bin\run.bat >nul
+          if not exist bin\run.bat ( echo [x] run.bat copy failed & exit /b 1 )
+          echo launcher attached.
+
       - name: 校验产物
         shell: cmd
         run: |
@@ -57,6 +64,7 @@ jobs:
           path: |
             bin/TaskbarEqWidth.exe
             bin/TaskbarEqWidthHook.dll
+            bin/run.bat
 
       - name: 写结果摘要
         shell: bash
@@ -70,10 +78,12 @@ jobs:
             echo ""
             echo "| 文件 | 用途 |"
             echo "|---|---|"
+            echo "| \`run.bat\` | **双击这个**：自带管理员提权与菜单 |"
             echo "| \`TaskbarEqWidth.exe\` | 管理器：安装 / 卸载 / 状态 |"
             echo "| \`TaskbarEqWidthHook.dll\` | 注入到 explorer 的钩子 |"
             echo ""
-            echo "**安装**：以管理员身份打开命令提示符，进入该文件夹，运行 \`TaskbarEqWidth.exe\`"
+            echo "解压后三个文件**必须放在同一个文件夹里**，然后双击 \`run.bat\`。"
             echo ""
-            echo "**完全卸载**：\`TaskbarEqWidth.exe --uninstall\`"
+            echo "注意：\`TaskbarEqWidth.exe\` 是控制台程序，直接双击它窗口会一闪而过，"
+            echo "看起来像没反应——请用 \`run.bat\`，或从命令提示符里运行。"
           } >> "$GITHUB_STEP_SUMMARY"

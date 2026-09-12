@@ -2,11 +2,18 @@
 //  hook.cpp —— TaskbarEqWidthHook.dll  （x64）
 //
 //  这个 DLL 会被注入到 explorer.exe，做一件事：
-//      把任务栏每个按钮的 IconPanel 宽度固定成同一个值 —— 也就是"等宽"。
+//      把任务栏每个按钮的宽度固定成同一个值 —— 也就是"等宽"。
 //
 //  原理（照搬 Windhawk 那个模块的公开思路，但只保留等宽这一条）：
 //      Taskbar.View.dll 里 TaskListButton::UpdateButtonPadding 每次布局都会调用，
-//      我们在它执行完之后，把按钮 XAML 元素里的 IconPanel.Width 改成固定值。
+//      我们在它执行完之后调整按钮 XAML 元素里的宽度。
+//
+//  Windows 有两套任务栏标签实现，按钮内部结构不同，所以这里有两条路径：
+//      A. 系统的原生标签实现：IconPanel 是 2 列 Grid（图标列 + 标签列），
+//         标签列是 Auto 宽度，直接改列宽会被系统重算回去，于是往该列塞一个
+//         固定宽度的空 Border 把列"撑"住，并给标签文字设 MaxWidth 防止撑开。
+//      B. 旧式实现：IconPanel 是普通面板，直接给它设 Width 即可。
+//      走哪条在运行时按 IconPanel 的列数自动判定，并写进 hook.log。
 //
 //  ---------------------------------------------------------------------------
 //  干净卸载（本文件最重要的部分）：
@@ -27,6 +34,7 @@
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.UI.Xaml.h>
 #include <winrt/Windows.UI.Xaml.Media.h>
+#include <winrt/Windows.UI.Xaml.Controls.h>
 
 #include <MinHook.h>
 
@@ -46,6 +54,10 @@
 
 using namespace winrt::Windows::UI::Xaml;
 using namespace winrt::Windows::UI::Xaml::Media;
+
+// 用别名而不是 using namespace：Media 与 Controls 里有若干同名类型，
+// 同时 using 进来会让重载解析变得难以预测。别名只解决书写长度，不引入歧义。
+namespace Controls = winrt::Windows::UI::Xaml::Controls;
 
 // ---------------------------------------------------------------------------
 //  全局状态
@@ -135,6 +147,85 @@ static FrameworkElement FindChildByName(DependencyObject const& root,
 // 只在头几次写日志，避免热路径把 hook.log 刷爆
 static std::atomic<int> g_logMissingPanel{0};
 static std::atomic<int> g_logApplied{0};
+static std::atomic<int> g_logPath{0};
+
+// ---------------------------------------------------------------------------
+//  两条路径：Windows 有两套任务栏标签实现，按钮内部结构完全不同，必须分别处理。
+//  只做一条的话，会出现"钩子挂上了、日志说成功、任务栏毫无变化"——最难查的失败。
+//
+//  判据（与 Windhawk taskbar-labels 模块一致）：带原生标签实现的系统里，
+//  IconPanel 是一个 **2 列 Grid**（第 0 列图标、第 1 列标签文字）；
+//  而旧实现里 IconPanel 是普通面板。
+// ---------------------------------------------------------------------------
+static const wchar_t* kSpacerName = L"TaskbarEqWidthSpacer";
+
+// 路径 B：普通面板 —— 直接给 IconPanel 定宽即可。返回是否真的改动了。
+static bool ApplyWidthPlainPanel(FrameworkElement const& iconPanel, double want) {
+    double cur = iconPanel.Width();
+    bool same = (cur == want) || (std::isnan(cur) && std::isnan(want));
+    if (same) return false;
+    iconPanel.Width(want);
+    return true;
+}
+
+// 路径 A：2 列 Grid（原生标签）—— 标签列是 Auto 宽度，直接改列宽会被系统的
+// 布局逻辑重算回去，所以改用"撑"的办法：往标签列塞一个固定宽度的空 Border，
+// 列是 Auto，会自动长到这个宽度；同时给标签文字设 MaxWidth，防止长标题把列撑开。
+// 卸载时把 Border 宽度归零，布局即恢复原样。
+// 这里的套路与 Windhawk 模块的 WindhawkLabelSpacer 完全相同（它也不删元素只归零，
+// 因为删除元素会引发布局异常）。
+static bool ApplyWidthLabelGrid(FrameworkElement const& buttonElement,
+                                Controls::Grid const& grid, double want) {
+    const bool unloading = std::isnan(want);   // 卸载时调用方传的就是 NaN
+
+    auto cols = grid.ColumnDefinitions();
+    if (cols.Size() < 2) return false;
+
+    auto iconElement = FindChildByName(grid, L"Icon");
+    if (!iconElement) return false;   // 结构不符，交给调用方记录
+
+    auto padding = grid.Padding();
+    double firstCol = 0.0;
+    auto c0 = cols.GetAt(0).Width();
+    if (c0.GridUnitType == GridUnitType::Pixel) firstCol = c0.Value;
+
+    // 目标：图标列 + 标签列 + 左右内边距 == want
+    double labelCol = want - firstCol - padding.Left - padding.Right;
+    if (!unloading && labelCol < 1.0) labelCol = 1.0;
+    double spacerWant = unloading ? 0.0 : labelCol;
+
+    auto spacer = FindChildByName(grid, kSpacerName);
+    if (!spacer) {
+        if (unloading) return false;   // 卸载时若没建过就不用建
+        Controls::Border b;
+        b.Name(kSpacerName);
+        b.Height(0);
+        Controls::Grid::SetColumn(b, 1);
+        grid.Children().Append(b);
+        spacer = b;
+    }
+
+    bool changed = false;
+    if (spacer.Width() != spacerWant) {
+        spacer.Width(spacerWant);
+        changed = true;
+    }
+
+    if (auto label = FindChildByName(grid, L"LabelControl").try_as<Controls::TextBlock>()) {
+        auto m = label.Margin();
+        // 加载时把标签限制在列宽内（超长标题变省略号）；卸载时交还默认值，
+        // 注意这里必须是 infinity（= XAML 的默认 MaxWidth）而不是 0，
+        // 写 0 会把标签文字整个裁没。
+        double maxW = unloading ? std::numeric_limits<double>::infinity()
+                                : std::fmax(0.0, spacerWant - m.Left - m.Right);
+        if (label.MaxWidth() != maxW) {
+            label.MaxWidth(maxW);
+            buttonElement.InvalidateMeasure();
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 // ---------------------------------------------------------------------------
 //  核心：给一个任务栏按钮应用固定宽度
@@ -163,16 +254,30 @@ static void ApplyFixedWidthToButton(void* pThis) {
                       ? std::numeric_limits<double>::quiet_NaN()
                       : static_cast<double>(g_itemWidth.load());
 
-    // 值没变就不写。XAML 属性写入会触发一次布局，而布局又会回调本函数，
-    // 这里过滤掉无效写入，可以少掉大量无谓的重排。
-    double cur = iconPanel.Width();
-    bool same = (cur == want) ||
-                (std::isnan(cur) && std::isnan(want));
-    if (!same) {
-        iconPanel.Width(want);
-        if (g_logApplied.fetch_add(1) < 1) {
-            LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP", want);
+    // 先判断本机走哪条路径，并把结论写进日志（只写一次）。
+    bool isLabelGrid = false;
+    Controls::Grid grid{nullptr};
+    if (auto g = iconPanel.try_as<Controls::Grid>()) {
+        try {
+            if (g.ColumnDefinitions().Size() >= 2) {
+                isLabelGrid = true;
+                grid = g;
+            }
+        } catch (...) {
+            // 属性读取在布局过渡期可能抛异常，按普通面板处理
         }
+    }
+    if (g_logPath.fetch_add(1) < 1) {
+        LogLine(L"[i] IconPanel 结构: %s",
+                isLabelGrid ? L"2 列 Grid（系统的原生标签实现），用标签列占位法"
+                            : L"普通面板（旧式实现），直接设置 IconPanel.Width");
+    }
+
+    bool changed = isLabelGrid ? ApplyWidthLabelGrid(buttonElement, grid, want)
+                               : ApplyWidthPlainPanel(iconPanel, want);
+
+    if (changed && g_logApplied.fetch_add(1) < 1) {
+        LogLine(L"[OK] 已开始对任务栏按钮应用固定宽度 %.0f DIP", want);
     }
 }
 
